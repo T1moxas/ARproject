@@ -1,5 +1,8 @@
 """LAN preview + compatibility API for roi-site/ar.html."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import unquote
+import mimetypes
 import threading
 import socket
 import json
@@ -8,6 +11,13 @@ import cv2
 import numpy as np
 
 SITE_ORIGIN = "https://tfhguk.github.io"
+SWARM_BUILD = Path(__file__).resolve().parents[1] / "web" / "dist"
+SWARM_MIME_TYPES = {
+    ".html": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".mjs": "text/javascript; charset=utf-8",
+}
 
 
 def _default_settings(rect, width, height, height_max=0.5, gamma=0.5, interval=1.0):
@@ -30,9 +40,12 @@ class DepthPreview:
     def __init__(self, host="0.0.0.0", port=8765, calibrated=False,
                  projection_size=(1280, 800), available_rect=None,
                  projector_ready=False, stage_hint=None, initial_settings=None,
-                 on_settings=None, on_action=None):
+                 on_settings=None, on_action=None, marker_origin=None):
         self._lock = threading.RLock()
         self._jpeg = None
+        self._marker_frame_id = 0
+        self._marker_stamp = None
+        self._markers = []
         self.calibrated = bool(calibrated)
         self.projector_ready = bool(projector_ready)
         self.stage_hint = stage_hint
@@ -51,16 +64,17 @@ class DepthPreview:
         owner = self
 
         class Handler(BaseHTTPRequestHandler):
+            def _route(self):
+                return self.path.partition("?")[0]
+
             def _cors(self):
                 origin = self.headers.get("Origin")
-                if origin == SITE_ORIGIN:
-                    self.send_header("Access-Control-Allow-Origin", SITE_ORIGIN)
+                markers = self._route() == "/api/v1/markers"
+                if origin and (origin == SITE_ORIGIN or (markers and origin == marker_origin)):
+                    self.send_header("Access-Control-Allow-Origin", origin)
                     self.send_header("Vary", "Origin")
-                # Chrome may ask permission for a public HTTPS page to reach a
-                # private/local service. Only the known page origin is allowed.
-                if origin == SITE_ORIGIN:
                     self.send_header("Access-Control-Allow-Private-Network", "true")
-                self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+                self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS" if markers else "GET, POST, OPTIONS")
                 self.send_header("Access-Control-Allow-Headers", "Content-Type")
                 self.send_header("Access-Control-Expose-Headers",
                                  "X-Snapshot-Id, X-Projection-Revision, X-Settings-Revision")
@@ -95,7 +109,14 @@ class DepthPreview:
 
             def do_GET(self):
                 try:
-                    if self.path == "/" or self.path.startswith("/?"):
+                    route = self._route()
+                    if route == "/swarm":
+                        self._send(308, b"", "text/plain", {"Location": "/swarm/"})
+                    elif route.startswith("/swarm/"):
+                        self._swarm_asset(route)
+                    elif route == "/api/v1/markers":
+                        self._json(200, owner._marker_state())
+                    elif route == "/":
                         self._send(200, owner.PAGE, "text/html; charset=utf-8")
                     elif self.path.startswith("/status"):
                         with owner._lock:
@@ -133,6 +154,23 @@ class DepthPreview:
                         self._send(404, b"Not found", "text/plain")
                 except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError, OSError):
                     pass
+
+            def _swarm_asset(self, route):
+                try:
+                    filename = unquote(route.removeprefix("/swarm/"), errors="strict") or "index.html"
+                    relative = Path(filename)
+                    if relative.anchor or ".." in relative.parts:
+                        raise FileNotFoundError
+                    root = SWARM_BUILD.resolve()
+                    path = (root / relative).resolve()
+                    if not path.is_relative_to(root) or not path.is_file():
+                        raise FileNotFoundError
+                    body = path.read_bytes()
+                except (ValueError, OSError, RuntimeError):
+                    self._send(404, b"Not found", "text/plain")
+                    return
+                content_type = SWARM_MIME_TYPES.get(path.suffix) or mimetypes.guess_type(path)[0]
+                self._send(200, body, content_type or "application/octet-stream")
 
             def do_POST(self):
                 if self.path.startswith("/api/v1/actions/"):
@@ -212,6 +250,7 @@ class DepthPreview:
         self.thread.start()
         self.port = self.server.server_address[1]
         print(f"Depth preview local: http://localhost:{self.port}/", flush=True)
+        print(f"AR Swarm local: http://localhost:{self.port}/swarm/", flush=True)
         addresses = self._lan_ipv4_addresses()
         for ip in addresses:
             print(f"Depth preview LAN: http://{ip}:{self.port}/", flush=True)
@@ -245,6 +284,24 @@ class DepthPreview:
                         "measured_fraction": 0.0, "filled_fraction": 0.0},
             "errors": [],
         }
+
+    def _marker_state(self):
+        with self._lock:
+            age = None if self._marker_stamp is None else max(0.0, time.perf_counter() - self._marker_stamp)
+            return {
+                "schema_version": 1,
+                "frame_id": self._marker_frame_id,
+                "age_s": age,
+                "projection": {"width": self.width, "height": self.height,
+                               "available_rect": list(self.available_rect)},
+                "markers": self._markers if age is not None and age <= 0.75 else [],
+            }
+
+    def update_markers(self, markers, stamp):
+        with self._lock:
+            self._marker_frame_id += 1
+            self._marker_stamp = stamp
+            self._markers = markers
 
     def _validate_settings(self, request):
         if request.get("schema_version") != 1:

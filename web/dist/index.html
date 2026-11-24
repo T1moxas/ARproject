@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0a0c14">
+  <meta name="description" content="Поле роя с трекингом ArUco и световыми эффектами для проектора.">
+  <title>AR-рой — Поле роя</title>
+  <link rel="stylesheet" href="./style.css">
+  <script type="module" src="./app.mjs"></script>
+</head>
+<body data-mode="demo">
+  <header class="masthead">
+    <div class="masthead-inner">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+        <div><strong>AR-рой</strong><span>Стереотрекинг ArUco</span></div>
+      </div>
+      <div class="source-tabs" role="group" aria-label="Источник координат">
+        <button id="demo-source" type="button" aria-pressed="true">Симуляция</button>
+        <button id="camera-source" type="button" aria-pressed="false" aria-haspopup="dialog">Камеры</button>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <div class="page-heading">
+      <div>
+        <h1>Поле роя</h1>
+        <p id="scene-description">Положение и курс маркеров в координатах проектора</p>
+      </div>
+      <div id="source-status" class="status-pill" data-state="demo" role="status">
+        <span class="status-dot" aria-hidden="true"></span><span id="status-label">Симуляция активна</span>
+      </div>
+    </div>
+
+    <div class="workspace">
+      <section class="stage panel" aria-labelledby="stage-title">
+        <div class="panel-heading stage-heading">
+          <h2 id="stage-title"><span class="icon icon-field" aria-hidden="true"></span>Рабочая зона</h2>
+          <span id="resolution" class="readout">1280 × 800 <small>PX</small></span>
+        </div>
+        <div class="viewport" id="viewport">
+          <canvas id="arena" tabindex="0" aria-label="Интерактивное поле маркеров" aria-describedby="field-hint">
+            Для отображения поля нужен Canvas.
+          </canvas>
+          <div class="viewport-tag" aria-hidden="true"><span></span><b id="view-label">ВИД СВЕРХУ</b></div>
+          <button class="button leave-projection" id="leave-projection" type="button" hidden>Выйти из проекции <kbd>Esc</kbd></button>
+        </div>
+        <div class="stage-footer">
+          <div class="transport">
+            <button class="button" id="pause" type="button"><span class="icon icon-pause" aria-hidden="true"></span><span id="pause-label">Пауза</span></button>
+            <button class="button icon-button" id="reset" type="button" title="Сбросить симуляцию" aria-label="Сбросить симуляцию"><span class="icon icon-reset" aria-hidden="true"></span></button>
+          </div>
+          <button class="button button-primary" id="project" type="button"><span class="icon icon-expand" aria-hidden="true"></span>На проектор</button>
+        </div>
+      </section>
+
+      <aside class="inspector" aria-label="Управление полем">
+        <section class="panel effects" aria-labelledby="effects-title">
+          <div class="panel-heading">
+            <h2 id="effects-title"><span class="icon icon-spark" aria-hidden="true"></span>Световые эффекты</h2>
+          </div>
+          <label class="effect-row effect-vector">
+            <span class="effect-glyph" aria-hidden="true">↗</span>
+            <span class="effect-name">Векторы курса</span>
+            <input id="vectors" type="checkbox" role="switch" checked>
+            <span class="switch" aria-hidden="true"></span>
+          </label>
+          <label class="effect-row effect-ring">
+            <span class="effect-glyph" aria-hidden="true">◎</span>
+            <span class="effect-name">Кольца поворота</span>
+            <input id="rings" type="checkbox" role="switch" checked>
+            <span class="switch" aria-hidden="true"></span>
+          </label>
+          <label class="effect-row effect-trail">
+            <span class="effect-glyph" aria-hidden="true">✦</span>
+            <span class="effect-name">Шлейф частиц</span>
+            <input id="trails" type="checkbox" role="switch" checked>
+            <span class="switch" aria-hidden="true"></span>
+          </label>
+        </section>
+
+        <section class="panel markers" aria-labelledby="markers-title">
+          <div class="panel-heading">
+            <h2 id="markers-title"><span class="icon icon-target" aria-hidden="true"></span>Маркеры</h2>
+            <span id="marker-count" class="readout marker-count" aria-label="Активные маркеры">6 / 6</span>
+          </div>
+          <div id="marker-list" class="marker-list" role="group" aria-label="Выбрать маркер"></div>
+        </section>
+      </aside>
+    </div>
+    <div class="scene-meta">
+      <p id="field-hint">Перетащите маркер или используйте <kbd>↑</kbd> <kbd>↓</kbd> <kbd>←</kbd> <kbd>→</kbd>. Поворот <kbd>Q</kbd> <kbd>E</kbd>.</p>
+      <p class="coordinates">X → <span>Y ↓</span></p>
+    </div>
+  </main>
+
+  <dialog id="connection" aria-labelledby="connection-title">
+    <form id="connection-form">
+      <h2 id="connection-title">Подключение камер</h2>
+      <p>Запустите <code>start.cmd --aruco</code> на компьютере с камерами.</p>
+      <label for="camera-address">Адрес службы AR</label>
+      <input id="camera-address" type="url" required spellcheck="false" autocomplete="url" placeholder="http://127.0.0.1:8765">
+      <p id="address-error" class="address-error" hidden>Укажите адрес HTTP или HTTPS без логина, пароля и пути.</p>
+      <div class="dialog-actions">
+        <button type="button" class="button" id="cancel-connect">Отмена</button>
+        <button type="submit" class="button button-primary" id="connect">Подключить</button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>

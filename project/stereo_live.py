@@ -12,6 +12,7 @@ from pathlib import Path
 import sys
 import threading
 import time
+from urllib.parse import urlsplit
 
 import cv2
 import numpy as np
@@ -28,6 +29,7 @@ CAPTURE_SIZE = (1280, 720)
 SIZES = ((640, 360), (1280, 720))
 PROJECTOR = "Stereo projector"
 PREVIEW = "Stereo cameras: 1=360p 2=720p B=BM G=SGBM Esc=exit"
+ARUCO_INTERVAL = 1 / 15
 
 
 def dpi_awareness():
@@ -239,7 +241,7 @@ class StereoEngine:
             speckleWindowSize=50, speckleRange=2, disp12MaxDiff=1,
             mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY)
 
-    def compute(self, left, right):
+    def rectify(self, left, right):
         gray = []
         for index, image in enumerate((left, right)):
             image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -248,7 +250,10 @@ class StereoEngine:
             if self.maps:
                 image = cv2.remap(image, *self.maps[index], interpolation=cv2.INTER_LINEAR)
             gray.append(image)
-        self.last_rectified = tuple(gray)
+        return tuple(gray)
+
+    def compute(self, left, right):
+        gray = self.last_rectified = self.rectify(left, right)
         matching_gray = ([cv2.copyMakeBorder(image, 0, 0, self.padding, self.padding,
                                              cv2.BORDER_REPLICATE) for image in gray]
                          if self.padding else gray)
@@ -432,6 +437,24 @@ class ArucoRobotTracker:
         return found, left_annotated, right_annotated
 
     @staticmethod
+    def projected_markers(detections, projector_model, rectangle):
+        """Project marker position and direction to the printed tag's top edge."""
+        left, top, right, bottom = rectangle
+        markers = []
+        for detection in detections:
+            forward = detection["camera_corners"][:2].mean(axis=0)
+            pixels, depth = project_points(projector_model.matrix, [detection["center"], forward])
+            if not np.isfinite(pixels).all() or not np.all(depth > 0):
+                continue
+            x, y = pixels[0]
+            dx, dy = pixels[1] - pixels[0]
+            if not (left <= x < right and top <= y < bottom) or math.hypot(dx, dy) < 1e-6:
+                continue
+            markers.append({"id": detection["id"], "x": float(x), "y": float(y),
+                            "angle": math.atan2(dy, dx)})
+        return markers
+
+    @staticmethod
     def overlay(base, detections, projector_model, rectangle):
         if not detections or projector_model is None:
             return base.copy()
@@ -539,7 +562,19 @@ def arguments():
     parser.add_argument("--aruco-glow-mm", type=float, default=160.0, help="Projected halo square side length in mm")
     parser.add_argument("--lan-preview", action="store_true", help="Serve the colourized depth preview over LAN HTTP")
     parser.add_argument("--lan-preview-port", type=int, default=8765, help="LAN preview HTTP port")
+    parser.add_argument("--lan-preview-origin",
+                        help="Allow marker reads from this additional web origin (e.g. https://example.com)")
     args = parser.parse_args()
+    if args.lan_preview_origin:
+        try:
+            origin = args.lan_preview_origin
+            parsed = urlsplit(origin)
+            if (parsed.scheme not in ("http", "https") or not parsed.hostname
+                    or parsed.username is not None or origin != f"{parsed.scheme}://{parsed.netloc}"
+                    or parsed.port == 0 or any(not 33 <= ord(char) <= 126 for char in origin)):
+                raise ValueError
+        except ValueError:
+            parser.error("Use an HTTP(S) origin without a path for --lan-preview-origin")
     saved_indices = [0, 1]
     if args.calibration.is_file() and (args.left is None or args.right is None):
         with np.load(args.calibration, allow_pickle=False) as saved:
@@ -644,13 +679,43 @@ def run(args):
         raise ValueError("Calibrate stereo cameras before setting the projector work area")
     updates = new_updates()
     field_rect = work_area.projector_rect if work_area else requested_rect or projector_bounds(output_size)
+    if aruco_tracker is not None and calibration is None:
+        raise ValueError("ArUco tracking needs calibrated stereo cameras")
     field_left, field_top, field_right, field_bottom = field_rect
     field_size = (field_right - field_left, field_bottom - field_top)
     cameras = [Camera(args.left, focus_values[0]), Camera(args.right, focus_values[1])]
     lan_preview = None
     if args.lan_preview:
         from depth_http_preview import DepthPreview
-        lan_preview = DepthPreview(port=args.lan_preview_port, calibrated=calibration is not None)
+        lan_preview = DepthPreview(port=args.lan_preview_port, calibrated=calibration is not None,
+                                   projection_size=output_size, available_rect=field_rect,
+                                   marker_origin=args.lan_preview_origin)
+    aruco_stop = threading.Event()
+    aruco_result_lock = threading.Lock()
+    aruco_result = aruco_thread = None
+
+    def track_aruco():
+        nonlocal aruco_result
+        # The 720p maps keep small tags detectable without a disparity pass.
+        engine = engines[CAPTURE_SIZE]
+        last_pair = (0, 0)
+        while not aruco_stop.is_set():
+            tick = time.perf_counter()
+            pair = choose_pair(cameras[0].snapshot(), cameras[1].snapshot(), last_pair,
+                               args.max_skew_ms / 1000)
+            if pair:
+                left, right = pair
+                last_pair = left.sequence, right.sequence
+                stamp = min(left.timestamp, right.timestamp)
+                rectified = engine.rectify(left.image, right.image)
+                result = aruco_tracker.detect_pair(*rectified, engine.rectified_intrinsic,
+                                                   engine.rectified_projections)
+                with aruco_result_lock:
+                    aruco_result = stamp, result
+                markers = aruco_tracker.projected_markers(result[0], projector_model, field_rect)
+                lan_preview.update_markers(markers, stamp)
+            aruco_stop.wait(max(0, ARUCO_INTERVAL - (time.perf_counter() - tick)))
+
     previous = (0, 0)
     aruco_detections = []
     aruco_annotated = None
@@ -762,7 +827,11 @@ def run(args):
         print(f"Starting two cameras; update mode: {args.update_mode}. 1/2: resolution; B/G: algorithm; "
               "S: appearance; F: fill; R: rescan; P: projector area; Esc: stop.", flush=True)
         if aruco_tracker is not None:
-            print("ArUco tracking enabled: DICT_4X4_50, IDs 0-5, marker 50 mm; white projector halo.", flush=True)
+            print(f"ArUco tracking enabled: DICT_4X4_50, IDs 0-5, marker {args.aruco_marker_mm:g} mm.",
+                  flush=True)
+            if lan_preview is not None:
+                aruco_thread = threading.Thread(target=track_aruco, name="aruco-stream", daemon=True)
+                aruco_thread.start()
         if calibration is None:
             print("UNCALIBRATED diagnostic disparity: colours are not measured depth.", flush=True)
         while True:
@@ -811,7 +880,14 @@ def run(args):
                 begin = now
                 next_probe = now + args.check_interval
                 raw_colors, depth, valid = engines[size].compute(left.image, right.image)
-                if aruco_tracker is not None and engines[size].last_rectified is not None:
+                if aruco_thread is not None:
+                    with aruco_result_lock:
+                        latest = aruco_result
+                    if latest is not None and time.perf_counter() - latest[0] < 0.5:
+                        aruco_detections, aruco_annotated, aruco_right_annotated = latest[1]
+                    else:
+                        aruco_detections, aruco_annotated, aruco_right_annotated = [], None, None
+                elif aruco_tracker is not None and engines[size].last_rectified is not None:
                     aruco_detections, aruco_annotated, aruco_right_annotated = aruco_tracker.detect_pair(
                         engines[size].last_rectified[0], engines[size].last_rectified[1],
                         engines[size].rectified_intrinsic, engines[size].rectified_projections)
@@ -1036,6 +1112,9 @@ def run(args):
     finally:
         if not completed:
             finish_period()
+        if aruco_thread is not None:
+            aruco_stop.set()
+            aruco_thread.join()
         if lan_preview is not None:
             lan_preview.close()
         for camera in cameras:
