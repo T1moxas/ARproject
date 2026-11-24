@@ -301,7 +301,7 @@ class ProjectorUpdateTests(unittest.TestCase):
                          hashlib.sha256(calibration.read_bytes()).hexdigest(),
                          projector_bounds((320, 180), projector_inset or 0, projector_inset_y or 0)).save(work_area)
             argv = ["stereo_live.py", "--calibration", str(calibration), "--output", str(root / "output"),
-                    "--seconds", str(seconds), "--update-mode", mode, "--width", "320", "--height", "180",
+                    "--seconds", str(seconds), "--update-mode", mode, "--windowed", "--width", "320", "--height", "180",
                     "--work-area", str(work_area), "--projector-model", str(root / "projector_model.json")]
             if projector_inset is not None:
                 argv += ["--projector-inset-x", str(projector_inset)]

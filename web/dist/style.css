@@ -150,6 +150,9 @@ h1 { font-size: clamp(34px, 4.3vw, 57px); line-height: 1.06; letter-spacing: -.0
 
 .stage { display: flex; flex-direction: column; padding: 0 8px; }
 .stage-heading { padding-inline: 9px; }
+.stage-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 5px 10px; }
+.stage-actions .button { min-height: 30px; }
+#depth-status { color: var(--muted); font: 11px/1.2 system-ui, sans-serif; }
 .viewport {
   isolation: isolate;
   position: relative;
@@ -188,6 +191,35 @@ body[data-mode="demo"] canvas[data-dragging="true"] { cursor: grabbing; }
 }
 .stage-footer { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 9px 0; }
 .transport { display: flex; gap: 6px; align-items: center; }
+body[data-mode="live"] .stage-footer { justify-content: flex-end; }
+body[data-mode="live"] .transport { display: none; }
+.camera-telemetry {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 8px;
+  margin: 0 auto 0 0;
+  padding: 0;
+  list-style: none;
+}
+.camera-channel {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 3px 7px;
+  padding: 4px 7px;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: #111727;
+  font-size: 11px;
+}
+.channel-dot { width: 5px; height: 5px; border-radius: 50%; background: currentColor; }
+.camera-channel { color: #ffadab; }
+.camera-channel[data-ready="true"] { color: #a7eecb; }
+.channel-label { color: #ecedf6; }
+.channel-index, .pair-skew { color: var(--muted); }
+.channel-signal { font-variant-numeric: tabular-nums; }
+.pair-skew { padding-inline: 4px; font-size: 11px; }
 .button {
   display: inline-flex;
   justify-content: center;
@@ -319,6 +351,8 @@ body[data-mode="demo"] canvas[data-dragging="true"] { cursor: grabbing; }
 .marker-direction { font: 14px/1 Consolas, "Liberation Mono", monospace; color: var(--marker); }
 .marker-row[data-present="false"] .marker-indicator,
 .marker-row[data-present="false"] .marker-direction { opacity: .36; }
+.marker-row[data-stale="true"] .marker-angle { color: #f4bc82; }
+.marker-detail { margin: 7px 15px 4px; color: var(--muted); font-size: 11px; }
 .scene-meta { display: flex; justify-content: space-between; gap: 16px; align-items: baseline; padding-top: 14px; }
 .scene-meta p { font-size: 12px; line-height: 1.7; color: var(--muted); }
 .scene-meta .coordinates { white-space: nowrap; font: 11px/1.6 Consolas, "Liberation Mono", monospace; letter-spacing: .06em; }
@@ -367,7 +401,7 @@ dialog::backdrop { background: #03040abb; }
 dialog h2 { font-size: 20px; }
 dialog p { margin-block: 12px 16px; color: var(--muted); font-size: 14px; line-height: 1.5; }
 dialog label { display: block; margin-bottom: 6px; font-size: 13px; }
-dialog input {
+dialog input:not([type="checkbox"]), dialog select {
   width: 100%;
   border: 1px solid #4b5775;
   border-radius: 7px;
@@ -375,6 +409,11 @@ dialog input {
   color: #fff;
   padding: 9px 10px;
 }
+dialog select { margin-bottom: 12px; }
+.projection-fields { min-width: 0; margin: 0; padding: 0; border: 0; }
+.projection-fields:disabled { opacity: .62; }
+.projection-fields .fullscreen-field { display: flex; align-items: center; gap: 7px; margin: 1px 0 0; }
+.projection-fields input[type="checkbox"] { accent-color: var(--accent); }
 dialog .address-error { color: #ffadab; margin-block: 8px; }
 .dialog-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
 
@@ -421,6 +460,10 @@ body[data-projection="true"] canvas { cursor: none; }
   .inspector { grid-template-columns: 1fr; }
   .viewport { height: clamp(290px, 90vw, 380px); }
   .coordinates { display: none; }
+  .stage-heading { padding-block: 8px; align-items: flex-start; }
+  .stage-heading h2 { align-self: center; }
+  .stage-actions { gap: 5px 8px; }
+  body[data-mode="live"] .stage-footer { flex-wrap: wrap; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { transition-duration: 0s !important; }

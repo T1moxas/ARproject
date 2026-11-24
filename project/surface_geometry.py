@@ -134,24 +134,27 @@ class FloorPlane:
 
 
 class HeightRenderer:
-    def __init__(self, floor, intrinsic, maximum=.5, gamma=.5, noise=.005):
-        if (not np.isfinite([maximum, gamma, noise]).all() or maximum <= noise
-                or noise < 0 or gamma <= 0):
+    def __init__(self, floor, intrinsic, maximum=.5, gamma=.5, noise=.005, *, minimum=0.):
+        if (not np.isfinite([minimum, maximum, gamma, noise]).all() or maximum <= max(noise, minimum)
+                or minimum < 0 or noise < 0 or gamma <= 0):
             raise ValueError('Invalid height colour settings')
         self.floor, self.intrinsic = floor, intrinsic
         self.maximum, self.gamma, self.noise = maximum, gamma, noise
+        self.minimum = minimum
         self.palette = Renderer(0, 1, bright=True, ascending=True)
 
     def colorize(self, depth):
         heights = self.floor.heights(depth, self.intrinsic)
-        normalized = np.clip((heights - self.noise) / (self.maximum - self.noise), 0, 1)
+        baseline = max(self.minimum, self.noise)
+        normalized = np.clip((heights - baseline) / (self.maximum - baseline), 0, 1)
         colors = self.palette.colorize(np.power(normalized, self.gamma))
         colors[~self.allowed(depth)] = 0
         return colors
 
     def allowed(self, depth):
         heights = self.floor.heights(depth, self.intrinsic)
-        return np.isfinite(heights) & (heights >= -self.noise) & (heights <= self.maximum + 1e-6)
+        bottom = self.minimum if self.minimum else -self.noise
+        return np.isfinite(heights) & (heights >= bottom) & (heights <= self.maximum + 1e-6)
 
     def render(self, display, measured_depth):
         heights = self.floor.heights(measured_depth, self.intrinsic)
@@ -278,7 +281,7 @@ class ProjectorModel:
             raise ValueError('3D projector model does not match this camera/projector setup')
         return cls(config['matrix'], output_size, calibration_hash, config.get('quality'))
 
-    def render(self, colors, depth, intrinsic, rectangle):
+    def render(self, colors, depth, intrinsic, rectangle, *, web=None, web_size=None):
         # Twice the camera resolution, then a bilinear splat with a z-buffer.
         expanded = cv2.resize(depth, None, fx=2, fy=2, interpolation=cv2.INTER_NEAREST)
         color = cv2.resize(colors, None, fx=2, fy=2, interpolation=cv2.INTER_LINEAR)
@@ -287,26 +290,34 @@ class ProjectorModel:
         k[1, 1] *= 2
         k[0, 2], k[1, 2] = (k[0, 2] + .5) * 2 - .5, (k[1, 2] + .5) * 2 - .5
         valid = np.isfinite(expanded) & (expanded > 0)
-        cloud, color = xyz_from_depth(expanded, k)[valid], color[valid]
+        cloud = xyz_from_depth(expanded, k)[valid]
         projected, z = project_points(self.matrix, cloud)
         left, top, right, bottom = rectangle
         good = np.isfinite(projected).all(axis=1) & (z > 0)
-        good &= (projected[:, 0] >= left) & (projected[:, 0] < right - 1)
-        good &= (projected[:, 1] >= top) & (projected[:, 1] < bottom - 1)
-        projected, z, color = projected[good], z[good], color[good]
+        good &= (projected[:, 0] >= left) & (projected[:, 0] < right)
+        good &= (projected[:, 1] >= top) & (projected[:, 1] < bottom)
+        projected, z = projected[good], z[good]
+        source = np.flatnonzero(valid)[good]
         w, h = self.output_size
         output = np.zeros((h, w, 3), np.uint8)
+        web_width, web_height = self.output_size if web_size is None else web_size
+        if web is not None and not (1 <= web_width <= w and 1 <= web_height <= h):
+            raise ValueError("Web raster must fit within the calibrated projector size")
+        web_output = np.zeros((web_height, web_width, 4), np.uint8) if web is not None else None
         if not len(projected):
-            return output
+            return (output, web_output) if web is not None else output
         xy = np.floor(projected).astype(np.int32)
         fraction = projected - xy
         indices, distances, weights, samples = [], [], [], []
         for dx, dy in ((0, 0), (1, 0), (0, 1), (1, 1)):
-            indices.append((xy[:, 1] + dy) * w + xy[:, 0] + dx)
-            distances.append(z)
-            weights.append((fraction[:, 0] if dx else 1 - fraction[:, 0])
-                           * (fraction[:, 1] if dy else 1 - fraction[:, 1]))
-            samples.append(color)
+            px, py = xy[:, 0] + dx, xy[:, 1] + dy
+            weight = ((fraction[:, 0] if dx else 1 - fraction[:, 0])
+                      * (fraction[:, 1] if dy else 1 - fraction[:, 1]))
+            inside = (px < right) & (py < bottom) & (weight > 1e-8)
+            indices.append(py[inside] * w + px[inside])
+            distances.append(z[inside])
+            weights.append(weight[inside])
+            samples.append(source[inside])
         index, distance, weight, sample = map(np.concatenate, (indices, distances, weights, samples))
         buffer = np.full(h * w, np.inf, np.float32)
         np.minimum.at(buffer, index, distance)
@@ -314,16 +325,60 @@ class ProjectorModel:
         index, weight, sample = index[visible], weight[visible], sample[visible]
         total = np.bincount(index, weights=weight, minlength=h * w)
         present = total > 1e-8
-        flat = output.reshape(-1, 3)
-        for channel in range(3):
-            value = np.bincount(index, weights=weight * sample[:, channel], minlength=h * w)
-            flat[present, channel] = np.rint(value[present] / total[present]).clip(0, 255).astype(np.uint8)
+        def blend_layer(image, target, bins, source_ids, weights, occupied, total_weight):
+            count = image.shape[2]
+            flat = target.reshape(-1, count)
+            values = image.reshape(-1, count)
+            for channel in range(count):
+                value = np.bincount(bins, weights=weights * values[source_ids, channel], minlength=len(flat))
+                flat[occupied, channel] = np.rint(value[occupied] / total_weight).clip(0, 255).astype(np.uint8)
+
+        blend_layer(color, output, index, sample, weight, present, total[present])
         coverage = present.reshape(h, w)
+        holes = np.empty(0, dtype=np.intp)
+        hole_sources = np.empty(0, dtype=np.intp)
         if coverage.any() and not coverage.all():
             distance, labels = cv2.distanceTransformWithLabels((~coverage).astype(np.uint8), cv2.DIST_L2, 5,
                                                               labelType=cv2.DIST_LABEL_PIXEL)
-            lookup = np.zeros((int(labels.max()) + 1, 3), np.uint8)
-            lookup[labels[coverage]] = output[coverage]
-            holes = ~coverage & (distance <= 2.5)
-            output[holes] = lookup[labels[holes]]
-        return clip_projector(output, rectangle)
+            holes = np.flatnonzero(~coverage & (distance <= 2.5))
+            source_by_label = np.empty(int(labels.max()) + 1, dtype=np.intp)
+            source_by_label[labels[coverage]] = np.flatnonzero(present)
+            hole_sources = source_by_label[labels.ravel()[holes]]
+            output.reshape(-1, 3)[holes] = output.reshape(-1, 3)[hole_sources]
+        clip_projector(output, rectangle)
+        if web is None:
+            return output
+
+        web_source = cv2.resize(web, None, fx=2, fy=2, interpolation=cv2.INTER_NEAREST)
+        if (web_width, web_height) == self.output_size:
+            blend_layer(web_source, web_output, index, sample, weight, present, total[present])
+            web_output.reshape(-1, 4)[holes] = web_output.reshape(-1, 4)[hole_sources]
+            return output, clip_projector(web_output, rectangle)
+
+        # Select the same native pixels as a nearest-neighbour resize after
+        # clipping. Resolve small holes to their existing coverage-label sources.
+        x = cv2.resize(np.arange(w, dtype=np.int32).reshape(1, -1), (web_width, 1),
+                       interpolation=cv2.INTER_NEAREST)
+        y = cv2.resize(np.arange(h, dtype=np.int32).reshape(-1, 1), (1, web_height),
+                       interpolation=cv2.INTER_NEAREST)
+        web_pixels = y * w + x
+        inside = (x >= left) & (x < right) & (y >= top) & (y < bottom)
+        seen = inside & present[web_pixels]
+        if len(holes):
+            missing = inside & ~seen
+            missing_pixels = web_pixels[missing]
+            candidates = np.searchsorted(holes, missing_pixels).clip(0, len(holes) - 1)
+            matches = holes[candidates] == missing_pixels
+            web_pixels[missing] = hole_sources[candidates]
+            seen[missing] = matches
+        if seen.any():
+            needed, inverse = np.unique(web_pixels[seen], return_inverse=True)
+            target_to_source = np.full(h * w, -1, dtype=np.int32)
+            target_to_source[needed] = np.arange(len(needed))
+            bins = target_to_source[index]
+            kept = np.flatnonzero(bins >= 0)
+            values = np.empty((1, len(needed), 4), dtype=np.uint8)
+            blend_layer(web_source, values, bins[kept], sample[kept], weight[kept],
+                        slice(None), total[needed])
+            web_output[seen] = values[0, inverse]
+        return output, web_output

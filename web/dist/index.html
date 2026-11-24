@@ -38,7 +38,11 @@
       <section class="stage panel" aria-labelledby="stage-title">
         <div class="panel-heading stage-heading">
           <h2 id="stage-title"><span class="icon icon-field" aria-hidden="true"></span>Рабочая зона</h2>
-          <span id="resolution" class="readout">1280 × 800 <small>PX</small></span>
+          <div class="stage-actions">
+            <span id="depth-status" class="readout" hidden>Ожидание карты</span>
+            <span id="resolution" class="readout">1280 × 800 <small>PX</small></span>
+            <button class="button" id="projector-settings" type="button" aria-haspopup="dialog" hidden>Проектор</button>
+          </div>
         </div>
         <div class="viewport" id="viewport">
           <canvas id="arena" tabindex="0" aria-label="Интерактивное поле маркеров" aria-describedby="field-hint">
@@ -52,7 +56,21 @@
             <button class="button" id="pause" type="button"><span class="icon icon-pause" aria-hidden="true"></span><span id="pause-label">Пауза</span></button>
             <button class="button icon-button" id="reset" type="button" title="Сбросить симуляцию" aria-label="Сбросить симуляцию"><span class="icon icon-reset" aria-hidden="true"></span></button>
           </div>
-          <button class="button button-primary" id="project" type="button"><span class="icon icon-expand" aria-hidden="true"></span>На проектор</button>
+          <ul id="camera-telemetry" class="camera-telemetry" aria-label="Состояние стереокамер" hidden>
+            <li class="camera-channel">
+              <span class="channel-dot" aria-hidden="true"></span>
+              <span class="channel-label">Левая <span class="channel-index"></span></span>
+              <span class="channel-signal"></span>
+            </li>
+            <li class="camera-channel">
+              <span class="channel-dot" aria-hidden="true"></span>
+              <span class="channel-label">Правая <span class="channel-index"></span></span>
+              <span class="channel-signal"></span>
+            </li>
+            <li id="pair-skew" class="pair-skew" hidden></li>
+            <li id="capture-size" class="pair-skew" hidden></li>
+          </ul>
+          <button class="button button-primary" id="project" type="button"><span class="icon icon-expand" aria-hidden="true"></span><span id="project-label">На проектор</span></button>
         </div>
       </section>
 
@@ -75,7 +93,7 @@
           </label>
           <label class="effect-row effect-trail">
             <span class="effect-glyph" aria-hidden="true">✦</span>
-            <span class="effect-name">Шлейф частиц</span>
+            <span class="effect-name" id="trails-label">Шлейф частиц</span>
             <input id="trails" type="checkbox" role="switch" checked>
             <span class="switch" aria-hidden="true"></span>
           </label>
@@ -87,6 +105,7 @@
             <span id="marker-count" class="readout marker-count" aria-label="Активные маркеры">6 / 6</span>
           </div>
           <div id="marker-list" class="marker-list" role="group" aria-label="Выбрать маркер"></div>
+          <p id="marker-detail" class="marker-detail" hidden></p>
         </section>
       </aside>
     </div>
@@ -99,13 +118,34 @@
   <dialog id="connection" aria-labelledby="connection-title">
     <form id="connection-form">
       <h2 id="connection-title">Подключение камер</h2>
-      <p>Запустите <code>start.cmd --aruco</code> на компьютере с камерами.</p>
+      <p>Запустите <code>.\start.cmd</code> на компьютере со стереопарой и проектором.</p>
       <label for="camera-address">Адрес службы AR</label>
       <input id="camera-address" type="url" required spellcheck="false" autocomplete="url" placeholder="http://127.0.0.1:8765">
       <p id="address-error" class="address-error" hidden>Укажите адрес HTTP или HTTPS без логина, пароля и пути.</p>
       <div class="dialog-actions">
         <button type="button" class="button" id="cancel-connect">Отмена</button>
         <button type="submit" class="button button-primary" id="connect">Подключить</button>
+      </div>
+    </form>
+  </dialog>
+  <dialog id="projector-dialog" aria-labelledby="projector-title">
+    <form id="projector-form">
+      <h2 id="projector-title">Настройки проектора</h2>
+      <p id="projector-message" role="status"></p>
+      <fieldset id="projector-fields" class="projection-fields" disabled>
+        <label for="display-mode">Дисплей</label>
+        <select id="display-mode" required></select>
+        <label for="display-resolution">Разрешение</label>
+        <select id="display-resolution" required></select>
+        <label for="projection-appearance" id="projection-appearance-label">Режим карты <kbd>S</kbd></label>
+        <select id="projection-appearance" required></select>
+        <label for="projection-fill" id="projection-fill-label">Заполнение <kbd>F</kbd></label>
+        <select id="projection-fill" required></select>
+        <label class="fullscreen-field"><input id="display-fullscreen" type="checkbox"> Полноэкранный режим</label>
+      </fieldset>
+      <div class="dialog-actions">
+        <button class="button" id="projector-close" type="button">Закрыть</button>
+        <button class="button button-primary" id="projector-apply" type="submit" disabled>Применить</button>
       </div>
     </form>
   </dialog>

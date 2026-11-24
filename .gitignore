@@ -1,0 +1,4 @@
+# Local release archives and Windows setup dependencies.
+/artifacts/
+/.venv/
+/wheelhouse/

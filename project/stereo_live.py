@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
+from contextlib import ExitStack
 from dataclasses import dataclass
 import hashlib
 import json
@@ -17,19 +18,24 @@ from urllib.parse import urlsplit
 import cv2
 import numpy as np
 
+from aruco_tracking import ArucoTrackHistory
+from projector_output import ProjectionControl, ProjectorOutput
 from rendering import Renderer
 from calibration_tools import summarize_distance
 from depth_appearance import DepthAppearance, STYLES
+from stereo_capture import open_stereo_cameras
 from surface_updates import SurfaceUpdates
-from work_area import WorkArea, calibrate_area, projector_bounds
+from work_area import WorkArea, calibrate_area, projector_bounds, projector_roi
 from surface_geometry import FloorPlane, HeightRenderer, ProjectorModel, project_points
+from web_depth import compact_layer, compact_size, surface_layer
 
 
 CAPTURE_SIZE = (1280, 720)
 SIZES = ((640, 360), (1280, 720))
 PROJECTOR = "Stereo projector"
 PREVIEW = "Stereo cameras: 1=360p 2=720p B=BM G=SGBM Esc=exit"
-ARUCO_INTERVAL = 1 / 15
+ARUCO_INTERVAL = 1.0
+CAMERA_FRESHNESS = 0.5
 
 
 def dpi_awareness():
@@ -53,10 +59,13 @@ class Frame:
 class Camera:
     """One capture thread per camera; bounded recent frames, no growing queue."""
 
-    def __init__(self, index, focus=None):
+    def __init__(self, index, focus=None, *, capture_size=CAPTURE_SIZE, fourcc=None):
         self.index = index
         self.focus = focus
-        self.frames = deque(maxlen=8)
+        self.capture_size = tuple(capture_size)
+        self.capture_fourcc = fourcc
+        frame_bytes = self.capture_size[0] * self.capture_size[1] * 3
+        self.frames = deque(maxlen=max(2, min(8, 32_000_000 // frame_bytes)))
         self.timestamps = deque(maxlen=90)
         self.lock = threading.Lock()
         self.stop = threading.Event()
@@ -66,16 +75,39 @@ class Camera:
         self.thread.start()
 
     def _open(self):
-        cap = cv2.VideoCapture(self.index, cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY)
+        backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
+        width, height = self.capture_size
+        cap = None
+        if self.capture_fourcc is not None and backend == cv2.CAP_DSHOW:
+            # OpenCV accepts simultaneous size/subtype as integer open parameters.
+            # Setting WIDTH, HEIGHT and FOURCC individually can reopen the driver
+            # in a smaller mode before the requested subtype takes effect.
+            codec = self.capture_fourcc
+            if codec >= 2 ** 31:
+                codec -= 2 ** 32
+            cap = cv2.VideoCapture(self.index, backend, [cv2.CAP_PROP_FRAME_WIDTH, width,
+                                                         cv2.CAP_PROP_FRAME_HEIGHT, height,
+                                                         cv2.CAP_PROP_FOURCC, codec])
+            if not cap.isOpened():
+                # Older OpenCV DirectShow backends only accept property setters.
+                cap.release()
+                cap = None
+        if cap is None:
+            cap = cv2.VideoCapture(self.index, backend)
         if not cap.isOpened():
             cap.release()
             raise OSError(f"Camera {self.index}: cannot open")
         try:
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAPTURE_SIZE[0])
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAPTURE_SIZE[1])
-            cap.set(cv2.CAP_PROP_FPS, 30)
-            # C920 DirectShow renegotiates format on size changes: set MJPG LAST.
-            cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            actual_size = (int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+            if self.capture_fourcc is None or actual_size != self.capture_size:
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            if self.capture_fourcc is None:
+                cap.set(cv2.CAP_PROP_FPS, 30)
+                # C920 DirectShow renegotiates format on size changes: set MJPG last.
+                cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+            elif (int(cap.get(cv2.CAP_PROP_FOURCC)) & 0xffffffff) != self.capture_fourcc:
+                cap.set(cv2.CAP_PROP_FOURCC, self.capture_fourcc)
             autofocus_disabled = cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
             if self.focus is not None:
                 cap.set(cv2.CAP_PROP_FOCUS, self.focus)
@@ -107,17 +139,20 @@ class Camera:
                             raise OSError(f"Camera {self.index}: no frames; reconnecting")
                         self.stop.wait(0.02)
                         continue
-                    if image.shape[:2] != (CAPTURE_SIZE[1], CAPTURE_SIZE[0]):
-                        raise OSError(f"Camera {self.index}: expected 1280x720, got {image.shape}")
+                    if image.shape[:2] != self.capture_size[::-1]:
+                        width, height = self.capture_size
+                        raise OSError(f"Camera {self.index}: expected {width}x{height}, got {image.shape}")
+                    if image.ndim == 2:
+                        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
                     failures = 0
-                    self.error = ""
                     sequence += 1
                     with self.lock:
+                        self.error = ""
                         self.frames.append(Frame(sequence, stamp, image))
                         self.timestamps.append(stamp)
             except (OSError, cv2.error) as exc:
-                self.error = str(exc)
                 with self.lock:
+                    self.error = str(exc)
                     self.frames.clear()
                     self.timestamps.clear()
                 self.stop.wait(1)
@@ -131,10 +166,21 @@ class Camera:
 
     def fps(self):
         with self.lock:
-            times = list(self.timestamps)
+            return self._fps_locked()
+
+    def _fps_locked(self):
+        times = self.timestamps
         if len(times) < 2 or times[-1] <= times[0]:
             return 0.0
         return (len(times) - 1) / (times[-1] - times[0])
+
+    def status(self):
+        with self.lock:
+            ready = bool(self.timestamps and
+                         time.perf_counter() - self.timestamps[-1] < CAMERA_FRESHNESS)
+            return {"index": self.index, "ready": ready,
+                    "fps": round(self._fps_locked(), 1) if ready else 0.0,
+                    "error": self.error}
 
     def close(self):
         self.stop.set()
@@ -146,7 +192,7 @@ def choose_pair(left_frames, right_frames, previous=(0, 0), max_skew=0.05, now=N
     now = time.perf_counter() if now is None else now
     choices = [(left, right) for left in left_frames for right in right_frames
                if left.sequence > previous[0] and right.sequence > previous[1]
-               and 0 <= now - min(left.timestamp, right.timestamp) < 0.5
+               and 0 <= now - min(left.timestamp, right.timestamp) < CAMERA_FRESHNESS
                and abs(left.timestamp - right.timestamp) <= max_skew]
     return max(choices, key=lambda pair: (min(pair[0].timestamp, pair[1].timestamp),
                                           -abs(pair[0].timestamp - pair[1].timestamp)), default=None)
@@ -154,7 +200,7 @@ def choose_pair(left_frames, right_frames, previous=(0, 0), max_skew=0.05, now=N
 
 class StereoEngine:
     def __init__(self, size, method="bm", calibration=None, disparities=None, low=0.3, high=4.0,
-                 lr_check=True, lr_threshold=1.5, pad_edges=True):
+                 lr_check=True, lr_threshold=1.5, pad_edges=True, *, rectification_only=False):
         self.size, self.method = size, method
         self.calibrated = calibration is not None
         self.renderer = Renderer(low, high)
@@ -182,14 +228,16 @@ class StereoEngine:
                     raise ValueError("Use a horizontal stereo rig (cameras side by side)")
                 self.maps = (cv2.initUndistortRectifyMap(k1, saved["D1"], r1, p1, size, cv2.CV_16SC2),
                              cv2.initUndistortRectifyMap(k2, saved["D2"], r2, p2, size, cv2.CV_16SC2))
+                self.rectified_intrinsic = p1[:, :3].copy()
+                # Projection matrices for stereo triangulation in rectified_left.
+                self.rectified_projections = (p1.copy(), p2.copy())
+                if rectification_only:
+                    return
                 ones = np.ones(size[::-1], np.uint8)
                 self.rectified_masks = [cv2.remap(ones, *maps, interpolation=cv2.INTER_NEAREST).astype(bool)
                                         for maps in self.maps]
                 self.sign = 1 if p2[0, 3] < 0 else -1
                 self.fx_baseline = abs(float(p2[0, 3]))
-                self.rectified_intrinsic = p1[:, :3].copy()
-                # Projection matrices for stereo triangulation in rectified_left.
-                self.rectified_projections = (p1.copy(), p2.copy())
                 # P2 = K [I | T] in the rectified left-camera frame.
                 # Convert right-camera PnP coordinates back into left-camera coordinates.
                 self.right_to_left_offset = np.array(
@@ -324,7 +372,7 @@ def sample_depth(depth, point=(0.5, 0.5), radius=3, allow_nonpositive=False):
 
 
 class ArucoRobotTracker:
-    """Detect matching robot tags in both rectified stereo views and fuse their poses."""
+    """Recover a rigid 50 mm tag pose from both rectified stereo images."""
 
     ALLOWED_IDS = set(range(6))
 
@@ -336,104 +384,91 @@ class ArucoRobotTracker:
         aruco = cv2.aruco
         dictionary = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
         parameters = aruco.DetectorParameters()
+        parameters.cornerRefinementMethod = aruco.CORNER_REFINE_SUBPIX
         self.detector = aruco.ArucoDetector(dictionary, parameters)
         half = self.marker_size / 2
         self.object_corners = np.array([
-            [-half, half, 0], [half, half, 0],
-            [half, -half, 0], [-half, -half, 0]
+            [-half, -half, 0], [half, -half, 0],
+            [half, half, 0], [-half, half, 0]
         ], dtype=np.float64)
-        glow_half = self.glow_size / 2
-        self.glow_corners = np.array([
-            [-glow_half, glow_half, 0], [glow_half, glow_half, 0],
-            [glow_half, -glow_half, 0], [-glow_half, -glow_half, 0]
-        ], dtype=np.float64)
+        self.glow_corners = self.object_corners * (self.glow_size / self.marker_size)
 
-    def _detect_one(self, gray, intrinsic):
+    def _detect_one(self, gray):
         corners, ids, _ = self.detector.detectMarkers(gray)
-        poses, accepted_corners, accepted_ids = {}, [], []
-        zero_distortion = np.zeros((5, 1), dtype=np.float64)
+        points, duplicates = {}, set()
         if ids is not None:
             for image_corners, raw_id in zip(corners, ids.reshape(-1)):
                 marker_id = int(raw_id)
-                if marker_id not in self.ALLOWED_IDS:
-                    continue
-                image_points = image_corners.reshape(4, 2).astype(np.float64)
-                ok, rvec, tvec = cv2.solvePnP(
-                    self.object_corners, image_points, intrinsic, zero_distortion,
-                    flags=cv2.SOLVEPNP_IPPE_SQUARE)
-                if not ok:
-                    continue
-                tvec = np.asarray(tvec, dtype=np.float64).reshape(3)
-                if not np.isfinite(tvec).all() or tvec[2] <= 0:
-                    continue
-                rotation, _ = cv2.Rodrigues(rvec)
-                poses[marker_id] = {
-                    "image_points": image_points,
-                    "center_pnp": tvec,
-                    "rotation_pnp": rotation,
-                }
-                accepted_corners.append(image_corners.reshape(1, 4, 2).astype(np.float32))
-                accepted_ids.append(marker_id)
+                if marker_id in self.ALLOWED_IDS:
+                    if marker_id in points:
+                        duplicates.add(marker_id)
+                    points[marker_id] = image_corners.reshape(4, 2).astype(np.float64)
+        for marker_id in duplicates:
+            del points[marker_id]
         annotated = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-        if accepted_ids:
+        if points:
             cv2.aruco.drawDetectedMarkers(
-                annotated, accepted_corners,
-                np.asarray(accepted_ids, dtype=np.int32).reshape(-1, 1))
-            for marker_id, image_corners in zip(accepted_ids, accepted_corners):
-                x, y = np.rint(image_corners[0].mean(axis=0)).astype(int)
-                cv2.putText(annotated, f"ROBOT {marker_id}", (x + 8, y - 8),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2, cv2.LINE_AA)
-        return poses, annotated
+                annotated, [value.reshape(1, 4, 2).astype(np.float32) for value in points.values()],
+                np.asarray(list(points), dtype=np.int32).reshape(-1, 1))
+        return points, annotated
+
+    def _stereo_pose(self, marker_id, left, right, projection_matrices, pixel_scale):
+        epipolar = float(np.sqrt(np.mean((left[:, 1] - right[:, 1]) ** 2)))
+        epipolar_limit = 2.5 * pixel_scale
+        edge_pixels = min(np.linalg.norm(np.roll(points, -1, axis=0) - points, axis=1).min()
+                          for points in (left, right))
+        if not np.isfinite(epipolar) or epipolar > epipolar_limit or edge_pixels < 8:
+            return None
+        # Triangulate correspondences in the existing rectified-left frame.
+        homogeneous = cv2.triangulatePoints(*projection_matrices, left.T, right.T)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            xyz = (homogeneous[:3] / homogeneous[3:4]).T
+        if not np.isfinite(xyz).all() or not np.all((xyz[:, 2] > .05) & (xyz[:, 2] < 8)):
+            return None
+        sides = np.linalg.norm(np.roll(xyz, -1, axis=0) - xyz, axis=1)
+        side_error = float(np.sqrt(np.mean((sides - self.marker_size) ** 2)))
+        if side_error > .25 * self.marker_size:
+            return None
+        centre = xyz.mean(axis=0)
+        u, _, vt = np.linalg.svd(self.object_corners.T @ (xyz - centre))
+        if np.linalg.det(vt.T @ u.T) < 0:
+            vt[-1] *= -1
+        rotation = vt.T @ u.T
+        rigid_corners = self.object_corners @ rotation.T + centre
+        errors = []
+        for matrix, observed in zip(projection_matrices, (left, right)):
+            projected, depth = project_points(matrix, rigid_corners)
+            if not np.isfinite(projected).all() or not np.all(depth > 0):
+                return None
+            errors.append(np.sum((projected - observed) ** 2, axis=1))
+        reprojection = float(np.sqrt(np.mean(errors)))
+        reprojection_limit = 3.0 * pixel_scale
+        if reprojection > reprojection_limit:
+            return None
+        quality = {
+            "epipolar_rms_px": round(epipolar, 3),
+            "reprojection_rms_px": round(reprojection, 3),
+            "side_error_mm": round(1000 * side_error, 2),
+            "min_side_px": round(float(edge_pixels), 2),
+            "score": round(math.exp(-.5 * ((epipolar / epipolar_limit) ** 2
+                                          + (reprojection / reprojection_limit) ** 2
+                                          + (side_error / (.25 * self.marker_size)) ** 2)), 3),
+        }
+        return {"id": marker_id, "center": centre, "rotation": rotation,
+                "local_glow": self.glow_corners, "camera_corners": self.glow_corners @ rotation.T + centre,
+                "quality": quality, "stereo_used": True}
 
     def detect_pair(self, left_gray, right_gray, intrinsic, projection_matrices):
-        left_poses, left_annotated = self._detect_one(left_gray, intrinsic)
-        right_poses, right_annotated = self._detect_one(right_gray, intrinsic)
-        p_left, p_right = projection_matrices
+        # Keep the intrinsic argument for existing calibration and preview callers.
+        left_points, left_annotated = self._detect_one(left_gray)
+        right_points, right_annotated = self._detect_one(right_gray)
+        pixel_scale = max(.5, left_gray.shape[1] / CAPTURE_SIZE[0])
         found = []
-        for marker_id in sorted(set(left_poses) & set(right_poses)):
-            lp, rp = left_poses[marker_id], right_poses[marker_id]
-            # Both images are already rectified. Triangulate corresponding
-            # corners into the exact rectified_left frame used by projector_model.
-            q = cv2.triangulatePoints(p_left, p_right,
-                                      lp["image_points"].T, rp["image_points"].T)
-            with np.errstate(divide="ignore", invalid="ignore"):
-                xyz = (q[:3] / q[3:4]).T
-            use_stereo = (xyz.shape == (4, 3) and np.isfinite(xyz).all()
-                          and np.all(xyz[:, 2] > 0.05) and np.all(xyz[:, 2] < 8.0))
-            if use_stereo:
-                centre = xyz.mean(axis=0)
-                # Marker local X points from corner 0 to 1; local Y from 0 to 3.
-                axis_x = ((xyz[1] - xyz[0]) + (xyz[2] - xyz[3])) * 0.5
-                axis_y = ((xyz[3] - xyz[0]) + (xyz[2] - xyz[1])) * 0.5
-                nx = np.linalg.norm(axis_x)
-                if nx < 1e-8:
-                    use_stereo = False
-                else:
-                    axis_x /= nx
-                    axis_y -= axis_x * float(axis_x @ axis_y)
-                    ny = np.linalg.norm(axis_y)
-                    if ny < 1e-8:
-                        use_stereo = False
-                    else:
-                        axis_y /= ny
-            if not use_stereo:
-                # Safe fallback: retain the working left-camera PnP path so
-                # a noisy/missing stereo correspondence never blanks projection.
-                centre = lp["center_pnp"]
-                rotation = lp["rotation_pnp"]
-                axis_x = rotation[:, 0]
-                axis_y = -rotation[:, 1]
-            half = self.glow_size * 0.5
-            # Axis Y is image-down; these four points form an oriented frame
-            # centred exactly on the estimated marker centre.
-            glow = np.array([
-                centre - axis_x * half - axis_y * half,
-                centre + axis_x * half - axis_y * half,
-                centre + axis_x * half + axis_y * half,
-                centre - axis_x * half + axis_y * half,
-            ], dtype=np.float64)
-            found.append({"id": marker_id, "center": centre,
-                          "camera_corners": glow, "stereo_used": bool(use_stereo)})
+        for marker_id in sorted(left_points.keys() & right_points.keys()):
+            detection = self._stereo_pose(marker_id, left_points[marker_id], right_points[marker_id],
+                                          projection_matrices, pixel_scale)
+            if detection is not None:
+                found.append(detection)
         return found, left_annotated, right_annotated
 
     @staticmethod
@@ -450,8 +485,15 @@ class ArucoRobotTracker:
             dx, dy = pixels[1] - pixels[0]
             if not (left <= x < right and top <= y < bottom) or math.hypot(dx, dy) < 1e-6:
                 continue
-            markers.append({"id": detection["id"], "x": float(x), "y": float(y),
-                            "angle": math.atan2(dy, dx)})
+            marker = {"id": detection["id"], "x": float(x), "y": float(y),
+                      "angle": math.atan2(dy, dx)}
+            if "rotation" in detection:
+                marker.update(position_m=np.asarray(detection["center"]).tolist(),
+                              rotation=np.asarray(detection["rotation"]).tolist(),
+                              coordinate_space="rectified_left", quality=detection["quality"],
+                              visible=detection.get("visible", True),
+                              last_seen_unix_ms=detection.get("last_seen_unix_ms"))
+            markers.append(marker)
         return markers
 
     @staticmethod
@@ -463,6 +505,8 @@ class ArucoRobotTracker:
         mask = np.zeros((h, w), dtype=np.uint8)
         polygons, centres = [], []
         for detection in detections:
+            if not detection.get("visible", True):
+                continue
             pixels, z = project_points(projector_model.matrix, detection["camera_corners"])
             centre_pixel, centre_z = project_points(
                 projector_model.matrix, np.asarray(detection["center"], dtype=np.float64).reshape(1, 3))
@@ -530,6 +574,9 @@ def arguments():
     parser.add_argument("--color-far", type=float, help="Far end of fixed colour scale; default: --far")
     parser.add_argument("--width", type=int, default=1280)
     parser.add_argument("--height", type=int, default=800)
+    parser.add_argument("--display", help="Windows display number (e.g. 2) or device ID")
+    parser.add_argument("--projector-resolution",
+                        help="Advertised display mode with calibrated aspect ratio, e.g. 1280x800")
     parser.add_argument("--x", type=int, default=1920)
     parser.add_argument("--y", type=int, default=0)
     parser.add_argument("--windowed", action="store_true")
@@ -547,7 +594,7 @@ def arguments():
     parser.add_argument("--floor-reference", type=Path, default=Path("stereo_calibration/floor_reference.json"))
     parser.add_argument("--height-max", type=float, default=.5, help="Maximum illuminated height above the floor, metres")
     parser.add_argument("--height-gamma", type=float, default=.5, help="Below 1 increases contrast near the floor")
-    parser.add_argument("--height-noise-mm", type=float, default=5., help="Neutral floor band for display")
+    parser.add_argument("--height-noise-mm", type=float, default=15., help="Neutral floor band for display")
     parser.add_argument("--projector-model", type=Path, default=Path("stereo_calibration/projector_model.json"))
     parser.add_argument("--projector-3d", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--reference-m", type=float,
@@ -558,13 +605,35 @@ def arguments():
     parser.add_argument("--seconds", type=float, default=0, help="Duration per mode, 0=until closed (compare: 10s)")
     parser.add_argument("--output", type=Path, default=Path("results/live"))
     parser.add_argument("--aruco", action="store_true", help="Track robot markers 0-5 (DICT_4X4_50) and project a white halo")
+    parser.add_argument("--aruco-if-ready", action="store_true", help="Enable marker tracking when all required calibrations are loaded")
+    parser.add_argument("--aruco-project-halo", action=argparse.BooleanOptionalAction, default=True,
+                        help="Show live native marker halos over the depth projection")
+    parser.add_argument("--swarm-only", action="store_true",
+                        help="Serve calibrated stereo marker tracking for the browser, without local windows or depth")
     parser.add_argument("--aruco-marker-mm", type=float, default=50.0, help="Physical marker side length in mm")
     parser.add_argument("--aruco-glow-mm", type=float, default=160.0, help="Projected halo square side length in mm")
     parser.add_argument("--lan-preview", action="store_true", help="Serve the colourized depth preview over LAN HTTP")
     parser.add_argument("--lan-preview-port", type=int, default=8765, help="LAN preview HTTP port")
+    parser.add_argument("--stream-port", type=int, default=8766, help="WebSocket port for depth and ArUco updates")
     parser.add_argument("--lan-preview-origin",
                         help="Allow marker reads from this additional web origin (e.g. https://example.com)")
     args = parser.parse_args()
+    if args.swarm_only:
+        if args.calibrate_area or args.compare:
+            parser.error("--swarm-only cannot be combined with --calibrate-area or --compare")
+        args.aruco = True
+        args.lan_preview = True
+    if args.projector_resolution is not None:
+        try:
+            args.projector_resolution = tuple(map(int, args.projector_resolution.lower().split("x")))
+            if len(args.projector_resolution) != 2 or min(args.projector_resolution) < 2:
+                raise ValueError
+        except ValueError:
+            parser.error("--projector-resolution needs WIDTHxHEIGHT")
+    if not (0 <= args.lan_preview_port <= 65535 and 0 <= args.stream_port <= 65535):
+        parser.error("Ports must be between 0 and 65535")
+    if args.lan_preview_port and args.lan_preview_port == args.stream_port:
+        parser.error("HTTP and WebSocket need distinct ports")
     if args.lan_preview_origin:
         try:
             origin = args.lan_preview_origin
@@ -626,9 +695,17 @@ def arguments():
 
 
 def run(args):
-    dpi_awareness()
-    args.output.mkdir(parents=True, exist_ok=True)
+    with ExitStack() as cleanup:
+        _run(args, cleanup)
+
+
+def _run(args, cleanup):
+    if not args.swarm_only:
+        dpi_awareness()
+        args.output.mkdir(parents=True, exist_ok=True)
     calibration = args.calibration if args.calibration.is_file() else None
+    if args.aruco and calibration is None:
+        raise ValueError("ArUco tracking needs calibrated stereo cameras")
     calibration_hash = hashlib.sha256(calibration.read_bytes()).hexdigest() if calibration else None
     focus_values = [args.focus_left, args.focus_right]
     if calibration is not None:
@@ -640,32 +717,18 @@ def run(args):
                     if focus_values[index] is not None and abs(focus_values[index] - value) > 0.5:
                         raise ValueError("Changed focus requires new stereo calibration")
                     focus_values[index] = float(value)
-    engines = {size: StereoEngine(size, args.method, calibration, args.disparities, args.near, args.far,
-                                 args.lr_check, args.lr_threshold, args.pad_edges)
-               for size in SIZES}
-    appearance_mode = args.appearance
-    fill_mode = args.fill
-    def new_updates():
-        return SurfaceUpdates(args.change_mm / 1000, args.update_interval, args.change_area,
-                              block=max(1, round(8 * size[0] / 640)), max_gap=max(5, args.check_interval * 4),
-                              region=work_area.mask(size[::-1]) if work_area else None)
-    appearances = {size: DepthAppearance(appearance_mode, size[0] / 640, fill_mode) for size in SIZES}
-    color_renderer = Renderer(args.color_near, args.color_far, bright=True)
-    size = tuple(map(int, args.size.split("x")))
     output_size = (args.width, args.height)
     floor_reference = (FloorPlane.load(args.floor_reference, calibration_hash)
-                       if args.height_map and not args.calibrate_area else None)
+                       if args.height_map and not (args.calibrate_area or args.swarm_only) else None)
     if floor_reference is not None and calibration is None:
         raise ValueError("Height mode needs stereo calibration")
-    height_renderers = ({item: HeightRenderer(floor_reference, engines[item].rectified_intrinsic,
-                                             args.height_max, args.height_gamma, args.height_noise_mm / 1000)
-                         for item in SIZES} if floor_reference else {})
     projector_model = (ProjectorModel.load(args.projector_model, output_size, calibration_hash)
                        if args.projector_3d and not args.calibrate_area and args.projector_model.is_file() else None)
-    aruco_tracker = (ArucoRobotTracker(args.aruco_marker_mm / 1000, args.aruco_glow_mm / 1000)
-                     if args.aruco else None)
-    if aruco_tracker is not None and projector_model is None:
+    if args.aruco and projector_model is None:
         raise ValueError("ArUco projector glow needs the calibrated 3D projector model; enable --projector-3d")
+    use_aruco = args.aruco or (args.aruco_if_ready and calibration is not None and projector_model is not None)
+    aruco_tracker = (ArucoRobotTracker(args.aruco_marker_mm / 1000, args.aruco_glow_mm / 1000)
+                     if use_aruco else None)
     requested_rect = (projector_bounds(output_size, args.projector_inset_x or 0, args.projector_inset_y or 0)
                       if args.projector_inset_x is not None or args.projector_inset_y is not None else None)
     work_area = None
@@ -677,56 +740,155 @@ def run(args):
                 raise
     if (work_area or args.calibrate_area) and calibration is None:
         raise ValueError("Calibrate stereo cameras before setting the projector work area")
-    updates = new_updates()
     field_rect = work_area.projector_rect if work_area else requested_rect or projector_bounds(output_size)
-    if aruco_tracker is not None and calibration is None:
-        raise ValueError("ArUco tracking needs calibrated stereo cameras")
-    field_left, field_top, field_right, field_bottom = field_rect
-    field_size = (field_right - field_left, field_bottom - field_top)
-    cameras = [Camera(args.left, focus_values[0]), Camera(args.right, focus_values[1])]
+    if not args.swarm_only:
+        engines = {size: StereoEngine(size, args.method, calibration, args.disparities, args.near, args.far,
+                                     args.lr_check, args.lr_threshold, args.pad_edges)
+                   for size in SIZES}
+    if aruco_tracker is not None:
+        cameras, capture_profile = open_stereo_cameras(
+            Camera, (args.left, args.right), focus_values, CAPTURE_SIZE, max_skew_s=args.max_skew_ms / 1000)
+    else:
+        cameras = [Camera(index, focus) for index, focus in zip((args.left, args.right), focus_values)]
+        capture_profile = None
+    for camera in cameras:
+        cleanup.callback(camera.close)
+    if capture_profile is not None:
+        marker_capture_size = tuple(capture_profile["size"])
+        aruco_engine = StereoEngine(marker_capture_size, calibration=calibration, rectification_only=True)
+    display_control = None
+    if not args.swarm_only:
+        projector_output = ProjectorOutput(PROJECTOR, output_size, args.x, args.y, not args.windowed,
+                                           display_id=args.display, size=args.projector_resolution)
+        display_control = ProjectionControl(projector_output, args.appearance, args.fill, STYLES, args.height_noise_mm)
+    rescan_request = threading.Event()
     lan_preview = None
     if args.lan_preview:
-        from depth_http_preview import DepthPreview
+        from depth_http_preview import DepthPreview, _default_settings
+
+        def camera_status():
+            return [camera.status() for camera in cameras]
+
+        def validate_legacy_settings(value):
+            if value["height_range_m"][1] <= args.height_noise_mm / 1000:
+                raise ValueError("Верхняя граница должна быть выше полосы шумоподавления")
+            projector_roi(value["roi"]["vertices"], output_size, field_rect)
+
+        stage = ("stereo_required" if calibration is None else
+                 "floor_required" if floor_reference is None and not args.swarm_only else
+                 "projector_required" if projector_model is None else "ready")
+        initial = _default_settings(field_rect, *output_size, args.height_max, args.height_gamma, args.update_interval)
         lan_preview = DepthPreview(port=args.lan_preview_port, calibrated=calibration is not None,
                                    projection_size=output_size, available_rect=field_rect,
-                                   marker_origin=args.lan_preview_origin)
+                                   initial_settings=initial, stage_hint=stage,
+                                   projector_ready=projector_model is not None and floor_reference is not None,
+                                   on_settings=validate_legacy_settings if stage == "ready" and display_control else None,
+                                   on_action=(lambda _: rescan_request.set()) if display_control else None,
+                                   marker_origin=args.lan_preview_origin,
+                                   data_origin=args.lan_preview_origin,
+                                   marker_camera_status=camera_status if aruco_tracker is not None else None,
+                                   max_pair_skew_ms=args.max_skew_ms,
+                                   marker_capture_profile=capture_profile,
+                                   stream_port=0 if args.lan_preview_port == 0 else args.stream_port,
+                                   projection_state=display_control.state if display_control else None,
+                                   on_projection_settings=display_control.request if display_control else None)
+        cleanup.callback(lan_preview.close)
+    if display_control is not None:
+        cleanup.callback(display_control.close)
     aruco_stop = threading.Event()
     aruco_result_lock = threading.Lock()
     aruco_result = aruco_thread = None
 
     def track_aruco():
         nonlocal aruco_result
-        # The 720p maps keep small tags detectable without a disparity pass.
-        engine = engines[CAPTURE_SIZE]
+        engine = aruco_engine
+        history = ArucoTrackHistory()
         last_pair = (0, 0)
+        last_stamp = None
+        last_error = ""
         while not aruco_stop.is_set():
             tick = time.perf_counter()
             pair = choose_pair(cameras[0].snapshot(), cameras[1].snapshot(), last_pair,
                                args.max_skew_ms / 1000)
+            poses = []
+            previews = None, None
+            skew_ms = None
             if pair:
                 left, right = pair
                 last_pair = left.sequence, right.sequence
-                stamp = min(left.timestamp, right.timestamp)
-                rectified = engine.rectify(left.image, right.image)
-                result = aruco_tracker.detect_pair(*rectified, engine.rectified_intrinsic,
-                                                   engine.rectified_projections)
-                with aruco_result_lock:
-                    aruco_result = stamp, result
-                markers = aruco_tracker.projected_markers(result[0], projector_model, field_rect)
-                lan_preview.update_markers(markers, stamp)
+                last_stamp = min(left.timestamp, right.timestamp)
+                try:
+                    rectified = engine.rectify(left.image, right.image)
+                    poses, left_preview, right_preview = aruco_tracker.detect_pair(
+                        *rectified, engine.rectified_intrinsic, engine.rectified_projections)
+                    if not args.swarm_only:
+                        previews = tuple(cv2.resize(image, SIZES[0], interpolation=cv2.INTER_AREA)
+                                         for image in (left_preview, right_preview))
+                    skew_ms = abs(left.timestamp - right.timestamp) * 1000
+                    last_error = ""
+                except cv2.error as exc:
+                    if str(exc) != last_error:
+                        last_error = str(exc)
+                        print(f"ArUco frame processing error: {exc}", file=sys.stderr, flush=True)
+            detections = history.update(poses, last_stamp if pair else tick)
+            with aruco_result_lock:
+                aruco_result = (tick, (detections, *previews))
+            if lan_preview is not None and last_stamp is not None:
+                markers = aruco_tracker.projected_markers(detections, projector_model, field_rect)
+                lan_preview.update_markers(markers, last_stamp, pair_skew_ms=skew_ms, capture_size=marker_capture_size)
             aruco_stop.wait(max(0, ARUCO_INTERVAL - (time.perf_counter() - tick)))
 
+    if aruco_tracker is not None:
+        print(f"ArUco tracking enabled: DICT_4X4_50, IDs 0-5, marker {args.aruco_marker_mm:g} mm.",
+              flush=True)
+        print(f"ArUco capture: {marker_capture_size[0]}x{marker_capture_size[1]} every {ARUCO_INTERVAL:g}s. "
+              f"{capture_profile['reason']}", flush=True)
+        aruco_thread = threading.Thread(target=track_aruco, name="aruco-stream", daemon=True)
+        aruco_thread.start()
+
+        def close_aruco():
+            aruco_stop.set()
+            aruco_thread.join()
+
+        cleanup.callback(close_aruco)
+    if args.swarm_only:
+        print(f"Stereo indices L/R: {args.left}/{args.right}; the capture loop retries unavailable cameras.",
+              flush=True)
+        print(f"Open http://localhost:{lan_preview.port}/swarm/?live=1 (Ctrl+C stops the service)", flush=True)
+        deadline = time.perf_counter() + args.seconds if args.seconds else math.inf
+        while (remaining := deadline - time.perf_counter()) > 0:
+            time.sleep(min(remaining, 0.2))
+        return
+
+    appearance_mode = args.appearance
+    fill_mode = args.fill
+    applied_revision = 0
+    roi_mask = None
+
+    def new_updates():
+        return SurfaceUpdates(args.change_mm / 1000, args.update_interval, args.change_area,
+                              block=max(1, round(8 * size[0] / 640)), max_gap=max(5, args.check_interval * 4),
+                              region=work_area.mask(size[::-1]) if work_area else None)
+
+    appearances = {size: DepthAppearance(appearance_mode, size[0] / 640, fill_mode) for size in SIZES}
+    color_renderer = Renderer(args.color_near, args.color_far, bright=True)
+    size = tuple(map(int, args.size.split("x")))
+    updates = new_updates()
+    height_renderers = ({item: HeightRenderer(floor_reference, engines[item].rectified_intrinsic,
+                                             args.height_max, args.height_gamma, args.height_noise_mm / 1000)
+                         for item in SIZES} if floor_reference else {})
+    field_left, field_top, field_right, field_bottom = field_rect
+    field_size = (field_right - field_left, field_bottom - field_top)
     previous = (0, 0)
     aruco_detections = []
     aruco_annotated = None
     aruco_right_annotated = None
-    projector_base = np.zeros((args.height, args.width, 3), np.uint8)
     periods = []
     measurements = deque(maxlen=900)
     frame_count = 0
     publication_count = 0
     next_probe = 0
-    published_depth = published_stamp = None
+    published_depth = published_stamp = published_guide = published_web = None
     shown_stamp = None
     display_result = colors = None
     style_stats = {"display_fraction": 0.0, "interpolated_fraction": 0.0, "held_fraction": 0.0,
@@ -743,13 +905,13 @@ def run(args):
     if args.compare:
         size = SIZES[0]
         updates = new_updates()
-    cv2.namedWindow(PROJECTOR, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(PROJECTOR, *output_size)
-    cv2.moveWindow(PROJECTOR, args.x, args.y)
-    cv2.imshow(PROJECTOR, np.zeros((args.height, args.width, 3), np.uint8))
-    cv2.waitKey(1)
-    if not args.windowed:
-        cv2.setWindowProperty(PROJECTOR, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    cleanup.callback(projector_output.restore_mode)
+    cv2.namedWindow(PROJECTOR, cv2.WINDOW_NORMAL | cv2.WINDOW_KEEPRATIO)
+    cleanup.callback(cv2.destroyAllWindows)
+    projector_output.configure(projector_output.initial)
+    projector_output.present(output)
+    if projector_output.presentation_error:
+        print(projector_output.presentation_error, flush=True)
     cv2.namedWindow(PREVIEW, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(PREVIEW, 1100, 650)
     cv2.moveWindow(PREVIEW, 30, 40)
@@ -796,6 +958,7 @@ def run(args):
                   "projector_rect": list(field_rect),
                   "height_mode": floor_reference is not None,
                   "height_max_m": args.height_max if floor_reference else None,
+                  "height_noise_mm": args.height_noise_mm if floor_reference else None,
                   "height_gamma": args.height_gamma if floor_reference else None,
                   "above_height_range": "black" if floor_reference else None,
                   "floor_plane_m": floor_reference.plane.tolist() if floor_reference else None,
@@ -823,18 +986,118 @@ def run(args):
         periods.append(period)
         print(json.dumps(period), flush=True)
 
+    def submit_projection():
+        projected = projector_output.present(output)
+        if lan_preview is not None and colors is not None:
+            lan_preview.update_projection(projected, published_web, legacy=colors, settings_revision=applied_revision,
+                                          metrics={
+                "check_hz": frame_count / max(.001, time.perf_counter() - started) if started else 0.,
+                "measured_fraction": style_stats.get("measured_fraction", 0.),
+                "filled_fraction": style_stats["interpolated_fraction"],
+                "noise_mm": args.height_noise_mm if floor_reference else None,
+                "capture_time_unix_ms": round((time.time() - (time.perf_counter() - published_stamp)) * 1000),
+                                          })
+
+    def render_snapshot(measured, stamp, guide, diagnostic_colors=None):
+        nonlocal published_depth, published_stamp, published_guide, published_web, shown_stamp
+        nonlocal display_result, colors, canonical, output, style_stats, publication_count
+        if measured is not None:
+            appearance = appearances[size]
+            if args.update_mode == "changes":
+                appearance.reset()
+            display_result = (work_area.process_display(appearance, measured, stamp, guide) if work_area
+                              else appearance.process(measured, stamp, guide))
+            renderer = height_renderers.get(size)
+            colors = (renderer.render(display_result, measured) if renderer else
+                      display_result.colorize(color_renderer))
+            style_stats = (work_area.statistics(display_result) if work_area else display_result.statistics())
+            web_layer = (surface_layer(display_result, renderer, args.color_far, args.color_near)
+                         if lan_preview is not None and (projector_model or work_area) else None)
+            if projector_model is not None:
+                projected = projector_model.render(colors, display_result.depth,
+                                                   engines[size].rectified_intrinsic, field_rect,
+                                                   web=web_layer,
+                                                   web_size=compact_size(*output_size) if web_layer is not None else None)
+                if web_layer is not None:
+                    output, web_layer = projected
+                else:
+                    output = projected
+            elif work_area:
+                output = work_area.project(colors)
+                if web_layer is not None:
+                    web_layer = compact_layer(work_area.project(web_layer))
+            if roi_mask is not None and web_layer is not None:
+                web_layer[compact_layer(roi_mask.astype(np.uint8)) == 0] = 0
+            published_web = web_layer
+            published_depth, published_guide = measured, guide
+        else:
+            colors = diagnostic_colors
+            output = work_area.project(colors) if work_area else output
+            published_web = None
+        canonical = cv2.resize(colors, CAPTURE_SIZE, interpolation=cv2.INTER_LINEAR)
+        if work_area:
+            cv2.polylines(canonical, [np.rint(work_area.scaled_points(canonical.shape)).astype(np.int32)],
+                          True, (0, 255, 0), 2)
+        elif not (projector_model and measured is not None):
+            output = np.zeros((args.height, args.width, 3), np.uint8)
+            output[field_top:field_bottom, field_left:field_right] = fit_image(canonical, field_size)
+        if calibration is None:
+            label(output[field_top:field_bottom, field_left:field_right],
+                  "UNCALIBRATED DISPARITY - NOT DEPTH", color=(0, 200, 255))
+        if aruco_tracker is not None and args.aruco_project_halo:
+            output = ArucoRobotTracker.overlay(
+                output, [pose for pose in aruco_detections if pose["visible"]], projector_model, field_rect)
+        if roi_mask is not None:
+            output[~roi_mask] = 0
+        published_stamp = shown_stamp = stamp
+        publication_count += 1
+        submit_projection()
+
+    def apply_projection_settings(settings, prior):
+        nonlocal appearance_mode, fill_mode, appearances, last_preview
+        changed_appearance = any(settings[key] != prior[key] for key in ("appearance", "fill"))
+        projector_output.configure(settings)
+        if changed_appearance:
+            appearance_mode, fill_mode = settings["appearance"], settings["fill"]
+            appearances = {item: DepthAppearance(appearance_mode, item[0] / 640, fill_mode) for item in SIZES}
+            last_preview = -1
+            if published_depth is not None:
+                render_snapshot(published_depth, published_stamp, published_guide)
+                return
+        submit_projection()
+
+    def apply_legacy_settings():
+        nonlocal applied_revision, roi_mask, updates, next_probe, height_renderers
+        revision, settings = lan_preview.settings_snapshot()
+        if revision == applied_revision:
+            return
+        minimum, maximum = settings["height_range_m"]
+        gamma = settings["palette_gamma"]
+        roi_mask = projector_roi(settings["roi"]["vertices"], output_size, field_rect)
+        args.height_max, args.height_gamma = maximum, gamma
+        args.update_interval = settings["update_interval_s"]
+        height_renderers = {
+            item: HeightRenderer(floor_reference, engines[item].rectified_intrinsic, maximum,
+                                 gamma, args.height_noise_mm / 1000, minimum=minimum)
+            for item in SIZES
+        }
+        applied_revision = revision
+        updates, next_probe = new_updates(), 0
+        if published_depth is not None:
+            render_snapshot(published_depth, published_stamp, published_guide)
+
     try:
         print(f"Starting two cameras; update mode: {args.update_mode}. 1/2: resolution; B/G: algorithm; "
               "S: appearance; F: fill; R: rescan; P: projector area; Esc: stop.", flush=True)
-        if aruco_tracker is not None:
-            print(f"ArUco tracking enabled: DICT_4X4_50, IDs 0-5, marker {args.aruco_marker_mm:g} mm.",
-                  flush=True)
-            if lan_preview is not None:
-                aruco_thread = threading.Thread(target=track_aruco, name="aruco-stream", daemon=True)
-                aruco_thread.start()
         if calibration is None:
             print("UNCALIBRATED diagnostic disparity: colours are not measured depth.", flush=True)
         while True:
+            display_control.service(apply_projection_settings)
+            if lan_preview is not None:
+                apply_legacy_settings()
+            if rescan_request.is_set():
+                rescan_request.clear()
+                updates, next_probe, last_preview = new_updates(), 0, -1
             if needs_area_calibration:
                 needs_area_calibration = False
 
@@ -858,7 +1121,7 @@ def run(args):
                     measurements, started, frame_count = deque(maxlen=900), None, 0
                     publication_count, next_probe = 0, 0
                     updates = new_updates()
-                    published_depth = published_stamp = display_result = colors = None
+                    published_depth = published_stamp = published_guide = published_web = display_result = colors = None
                     style_stats = {key: 0. for key in style_stats}
                     shown_stamp = None
                     canonical = np.zeros((720, 1280, 3), np.uint8)
@@ -866,7 +1129,7 @@ def run(args):
                     print(f"Work area saved: {args.work_area}", flush=True)
                 elif args.calibrate_area and started is None:
                     break
-                cv2.imshow(PROJECTOR, output)
+                projector_output.present(output)
                 previous, next_probe, last_preview = (0, 0), 0, -1
             due = args.update_mode == "live" or time.perf_counter() >= next_probe
             pair = (choose_pair(cameras[0].snapshot(), cameras[1].snapshot(), previous,
@@ -883,14 +1146,10 @@ def run(args):
                 if aruco_thread is not None:
                     with aruco_result_lock:
                         latest = aruco_result
-                    if latest is not None and time.perf_counter() - latest[0] < 0.5:
+                    if latest is not None and time.perf_counter() - latest[0] <= ARUCO_INTERVAL + .5:
                         aruco_detections, aruco_annotated, aruco_right_annotated = latest[1]
                     else:
                         aruco_detections, aruco_annotated, aruco_right_annotated = [], None, None
-                elif aruco_tracker is not None and engines[size].last_rectified is not None:
-                    aruco_detections, aruco_annotated, aruco_right_annotated = aruco_tracker.detect_pair(
-                        engines[size].last_rectified[0], engines[size].last_rectified[1],
-                        engines[size].rectified_intrinsic, engines[size].rectified_projections)
                 if work_area and depth is not None:
                     depth = work_area.restrict(depth)
                     raw_colors = raw_colors.copy()
@@ -902,46 +1161,8 @@ def run(args):
                 accepted = (depth if args.update_mode == "live" else updates.observe(depth, stamp)) if depth is not None else None
                 publish = accepted is not None or depth is None
                 if publish:
-                    if accepted is not None:
-                        # Snapshots are independent; do not blend in the old relief.
-                        if args.update_mode == "changes":
-                            appearances[size].reset()
-                        display_result = (work_area.process_display(appearances[size], accepted, stamp,
-                                                                   engines[size].last_rectified[0])
-                                          if work_area else appearances[size].process(
-                                              accepted, stamp, engines[size].last_rectified[0]))
-                        colors = (height_renderers[size].render(display_result, accepted) if floor_reference
-                                  else display_result.colorize(color_renderer))
-                        style_stats = (work_area.statistics(display_result) if work_area
-                                       else display_result.statistics())
-                        published_depth = accepted.copy()
-                    else:
-                        colors = raw_colors
-                    published_stamp = stamp
-                    shown_stamp = stamp
-                    publication_count += 1
-                    canonical = cv2.resize(colors, CAPTURE_SIZE, interpolation=cv2.INTER_LINEAR)
-                    if work_area and projector_model and display_result is not None:
-                        output = projector_model.render(colors, display_result.depth,
-                                                        engines[size].rectified_intrinsic, field_rect)
-                    elif work_area:
-                        output = work_area.project(colors)
-                    else:
-                        output = np.zeros((args.height, args.width, 3), np.uint8)
-                        output[field_top:field_bottom, field_left:field_right] = fit_image(canonical, field_size)
-                    if work_area:
-                        cv2.polylines(canonical, [np.rint(work_area.scaled_points(canonical.shape)).astype(np.int32)],
-                                      True, (0, 255, 0), 2)
-                    if calibration is None:
-                        label(output[field_top:field_bottom, field_left:field_right],
-                              "UNCALIBRATED DISPARITY - NOT DEPTH", color=(0, 200, 255))
-                    projector_base = output.copy()
-                    if aruco_tracker is not None:
-                        output = ArucoRobotTracker.overlay(projector_base, aruco_detections,
-                                                           projector_model, field_rect)
-                    cv2.imshow(PROJECTOR, output)
-                    if lan_preview is not None:
-                        lan_preview.update(colors)
+                    guide = engines[size].last_rectified[0] if accepted is not None else None
+                    render_snapshot(accepted, stamp, guide, raw_colors)
                 appearance_ms = (time.perf_counter() - appearance_begin) * 1000
                 if pending_check is not None:
                     value = sample_depth(depth, sample_point)
@@ -1059,7 +1280,7 @@ def run(args):
                         measurements, started, frame_count = deque(maxlen=900), None, 0
                         publication_count, next_probe = 0, 0
                         updates = new_updates()
-                        published_depth = published_stamp = display_result = colors = None
+                        published_depth = published_stamp = published_guide = published_web = display_result = colors = None
                     else:
                         completed = True
                         break
@@ -1069,8 +1290,10 @@ def run(args):
                     status = np.zeros((args.height, args.width, 3), np.uint8)
                     label(status[field_top:field_bottom, field_left:field_right],
                           "Waiting for two fresh camera frames")
-                    cv2.imshow(PROJECTOR, status)
-                if time.perf_counter() - opened > 20 and started is None:
+                    projector_output.present(status)
+                if duration and started is None and time.perf_counter() - opened >= duration:
+                    break
+                if lan_preview is None and time.perf_counter() - opened > 20 and started is None:
                     raise OSError("No paired frames. Check camera indices, other apps and receipt skew tolerance")
             if key in (27, ord("q"), ord("Q")):
                 break
@@ -1080,26 +1303,18 @@ def run(args):
                 break
             if key in (ord("v"), ord("V")) and calibration is not None and args.reference_m is not None:
                 pending_check = {"samples": [], "attempts": 0}
-            if not args.compare and key in (ord("s"), ord("S"), ord("f"), ord("F"), ord("r"), ord("R")):
-                finish_period()
-                if key in (ord("f"), ord("F")):
-                    fill_mode = "conservative" if fill_mode == "surface" else "surface"
-                elif key in (ord("s"), ord("S")):
-                    modes = list(STYLES)
-                    appearance_mode = modes[(modes.index(appearance_mode) + 1) % len(modes)]
-                appearances = {item: DepthAppearance(appearance_mode, item[0] / 640, fill_mode) for item in SIZES}
-                measurements, started, frame_count = deque(maxlen=900), None, 0
-                publication_count, next_probe = 0, 0
-                updates = new_updates()
-                published_depth = published_stamp = display_result = colors = None
-                last_preview = -1
-            if not args.compare and key in (ord("1"), ord("2"), ord("b"), ord("g")):
+            if not args.compare and key in (ord("s"), ord("S"), ord("f"), ord("F")):
+                setting = "appearance" if key in (ord("s"), ord("S")) else "fill"
+                display_control.cycle(setting, apply_projection_settings)
+            if not args.compare and key in (ord("r"), ord("R")):
+                rescan_request.set()
+            if not args.compare and key in (ord("1"), ord("2"), ord("b"), ord("B"), ord("g"), ord("G")):
                 pending_check = None
                 finish_period()
                 if key in (ord("1"), ord("2")):
                     size = SIZES[key - ord("1")]
                 else:
-                    method = "bm" if key == ord("b") else "sgbm"
+                    method = "bm" if key in (ord("b"), ord("B")) else "sgbm"
                     engines = {item: StereoEngine(item, method, calibration, args.disparities, args.near, args.far,
                                                  args.lr_check, args.lr_threshold, args.pad_edges)
                                for item in SIZES}
@@ -1108,18 +1323,10 @@ def run(args):
                 measurements, started, frame_count = deque(maxlen=900), None, 0
                 publication_count, next_probe = 0, 0
                 updates = new_updates()
-                published_depth = published_stamp = display_result = colors = None
+                published_depth = published_stamp = published_guide = published_web = display_result = colors = None
     finally:
         if not completed:
             finish_period()
-        if aruco_thread is not None:
-            aruco_stop.set()
-            aruco_thread.join()
-        if lan_preview is not None:
-            lan_preview.close()
-        for camera in cameras:
-            camera.close()
-        cv2.destroyAllWindows()
         report = {"calibrated": calibration is not None, "capture_size": list(CAPTURE_SIZE),
                   "calibration_sha256": calibration_hash, "distance_checks": distance_checks,
                   "camera_settings": [camera.info for camera in cameras], "periods": periods,
@@ -1143,7 +1350,12 @@ def run(args):
 
 if __name__ == "__main__":
     try:
-        run(arguments())
+        options = arguments()
+        gui = next((line.split(":", 1)[1].strip() for line in cv2.getBuildInformation().splitlines()
+                    if line.lstrip().startswith("GUI:")), "")
+        if not options.swarm_only and gui in ("", "NONE"):
+            raise ValueError("OpenCV has no HighGUI. Run setup.cmd to install the Windows GUI build.")
+        run(options)
     except KeyboardInterrupt:
         pass
     except (OSError, ValueError, KeyError, cv2.error) as exc:

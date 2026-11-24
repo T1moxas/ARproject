@@ -1,16 +1,21 @@
+import hashlib
 import json
 import math
 from pathlib import Path
+import sys
 import tempfile
+import threading
 import time
 import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
+import cv2
 import numpy as np
 
 from depth_http_preview import DepthPreview
+import stereo_live
 from stereo_live import ArucoRobotTracker
 from surface_geometry import ProjectorModel
 
@@ -71,6 +76,24 @@ class MarkerPreviewTests(unittest.TestCase):
         self.assertGreaterEqual(state["age_s"], 1)
         self.assertEqual(state["markers"], [])
 
+    def test_camera_health_distinguishes_ready_pairs_from_missing_camera(self):
+        cameras = [{"index": 1, "ready": True, "fps": 30.0, "error": ""},
+                   {"index": 0, "ready": True, "fps": 29.8, "error": ""}]
+        markers = [{"id": 0, "x": 550, "y": 380, "angle": math.pi / 4}]
+        self.preview.update_markers(markers, time.perf_counter(), pair_skew_ms=8.0)
+        with patch.object(self.preview, "_marker_camera_status", lambda: cameras), \
+                patch.object(self.preview, "_max_pair_skew_ms", 50):
+            with self.fetch("/api/v1/markers") as response:
+                state = json.load(response)
+            self.assertEqual(state["tracking"], {"cameras": cameras, "pair_skew_ms": 8.0, "max_skew_ms": 50})
+            self.assertEqual(state["markers"], markers)
+            cameras[1] = {"index": 0, "ready": False, "fps": 0.0, "error": "Camera 0: cannot open"}
+            with self.fetch("/api/v1/markers") as response:
+                state = json.load(response)
+            self.assertEqual(state["tracking"]["cameras"], cameras)
+            self.assertIsNone(state["tracking"]["pair_skew_ms"])
+            self.assertEqual(state["markers"], [])
+
     def test_additional_origin_is_limited_to_marker_reads(self):
         headers = {"Origin": "https://example.com"}
         with self.fetch("/api/v1/markers", method="OPTIONS", headers=headers) as response:
@@ -96,3 +119,96 @@ class MarkerPreviewTests(unittest.TestCase):
                     self.fetch("/swarm/%2e%2e%2fprivate.txt")
                 self.assertEqual(blocked.exception.code, 404)
                 blocked.exception.close()
+
+
+class SwarmOnlyTests(unittest.TestCase):
+    def test_startup_uses_calibration_and_reports_markers_without_depth_or_windows(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            calibration = root / "stereo.npz"
+            model = root / "projector.json"
+            output_size = (1280, 800)
+            intrinsic = np.array([[900., 0., 640.], [0., 900., 360.], [0., 0., 1.]])
+            np.savez(calibration, K1=intrinsic, K2=intrinsic, D1=np.zeros(5), D2=np.zeros(5),
+                     R=np.eye(3), T=[-0.12, 0, 0], capture_size=stereo_live.CAPTURE_SIZE,
+                     camera_indices=[1, 0], focus_values=[0., 0.])
+            ProjectorModel(np.column_stack((intrinsic, np.zeros(3))), output_size,
+                           hashlib.sha256(calibration.read_bytes()).hexdigest()).save(model)
+            argv = ["stereo_live.py", "--swarm-only", "--calibration", str(calibration),
+                    "--projector-model", str(model), "--work-area", str(root / "area.json"),
+                    "--height-map", "--floor-reference", str(root / "floor.json"),
+                    "--output", str(root / "output"), "--seconds", "1", "--lan-preview-port", "0"]
+            with patch.object(sys, "argv", argv):
+                args = stereo_live.arguments()
+
+            dictionary = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_50)
+            tag = cv2.aruco.generateImageMarker(dictionary, 2, 50)
+            cameras = []
+            previews = []
+            started = threading.Event()
+
+            class FakeCamera:
+                def __init__(self, index, focus):
+                    self.index, self.focus = index, focus
+                    self.closed = False
+                    self.image = np.full((720, 1280, 3), 255, np.uint8)
+                    x = 635 if index == 1 else 517
+                    self.image[335:385, x:x + 50] = tag[:, :, None]
+                    cameras.append(self)
+
+                def snapshot(self):
+                    sequence = int(time.perf_counter() * 30)
+                    return [stereo_live.Frame(sequence, sequence / 30 - self.index * .004, self.image)]
+
+                def status(self):
+                    return {"index": self.index, "ready": True, "fps": 30.0, "error": ""}
+
+                def close(self):
+                    self.closed = True
+
+            def start_preview(**kwargs):
+                preview = DepthPreview(host="127.0.0.1", **kwargs)
+                previews.append(preview)
+                started.set()
+                return preview
+
+            with patch.object(stereo_live, "Camera", FakeCamera), \
+                    patch("stereo_capture._enumerate_with_deadline", return_value=({}, None)), \
+                    patch("depth_http_preview.DepthPreview", start_preview), \
+                    patch.object(stereo_live.StereoEngine, "_make_matcher", side_effect=AssertionError), \
+                    patch.object(cv2, "namedWindow", side_effect=AssertionError):
+                error = []
+
+                def run():
+                    try:
+                        stereo_live.run(args)
+                    except Exception as exc:
+                        error.append(exc)
+                        started.set()
+
+                service = threading.Thread(target=run, daemon=True)
+                service.start()
+                try:
+                    self.assertTrue(started.wait(3))
+                    self.assertFalse(error)
+                    endpoint = f"http://127.0.0.1:{previews[0].port}/api/v1/markers"
+                    limit = time.perf_counter() + .9
+                    while True:
+                        with urlopen(endpoint, timeout=1) as response:
+                            state = json.load(response)
+                        if state["markers"] or time.perf_counter() >= limit:
+                            break
+                        time.sleep(.02)
+                finally:
+                    service.join(timeout=3)
+
+            self.assertFalse(service.is_alive())
+            self.assertFalse(error)
+            self.assertEqual([(cam.index, cam.focus) for cam in cameras], [(1, 0.0), (0, 0.0)])
+            self.assertTrue(all(cam.closed for cam in cameras))
+            self.assertFalse(args.output.exists())
+            self.assertEqual([camera["index"] for camera in state["tracking"]["cameras"]], [1, 0])
+            self.assertLessEqual(state["tracking"]["pair_skew_ms"], state["tracking"]["max_skew_ms"])
+            self.assertEqual([marker["id"] for marker in state["markers"]], [2])
+            self.assertAlmostEqual(state["markers"][0]["x"], 659.5, delta=2)
+            self.assertAlmostEqual(state["markers"][0]["y"], 359.5, delta=2)

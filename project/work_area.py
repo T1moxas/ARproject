@@ -31,6 +31,33 @@ def clip_projector(image, rectangle):
     return image
 
 
+def projector_roi(vertices, output_size, rectangle):
+    """Validate and rasterize a simple polygon in calibrated projector pixels."""
+    points = np.asarray(vertices, np.float64) * output_size
+    if points.ndim != 2 or points.shape[1] != 2 or len(points) < 3 or not np.isfinite(points).all():
+        raise ValueError("Invalid projector polygon")
+    if len(np.unique(points, axis=0)) != len(points) or cv2.contourArea(points.astype(np.float32)) < 1:
+        raise ValueError("Projector polygon must enclose a nonempty area")
+
+    def side(a, b, c):
+        u, v = b - a, c - a
+        return u[0] * v[1] - u[1] * v[0]
+
+    edges = list(zip(points, np.roll(points, -1, axis=0)))
+    for i, (a, b) in enumerate(edges):
+        for j, (c, d) in enumerate(edges[i + 2:], i + 2):
+            if i == 0 and j == len(edges) - 1:
+                continue
+            overlap = np.all(np.maximum(np.minimum(a, b), np.minimum(c, d))
+                             <= np.minimum(np.maximum(a, b), np.maximum(c, d)))
+            if overlap and side(a, b, c) * side(a, b, d) <= 0 and side(c, d, a) * side(c, d, b) <= 0:
+                raise ValueError("Projector polygon must not intersect itself")
+    w, h = output_size
+    mask = np.zeros((h, w), np.uint8)
+    cv2.fillPoly(mask, [np.rint(points).astype(np.int32)], 1)
+    return clip_projector(mask, rectangle).astype(bool)
+
+
 class WorkArea:
     def __init__(self, points, input_size, output_size, calibration_hash, projector_rect=None):
         self.points = np.array(points, dtype=np.float32, copy=True)

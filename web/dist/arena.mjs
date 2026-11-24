@@ -3,6 +3,8 @@ const MAX_PARTICLES = 480;
 const TRAIL_POINTS = 64;
 const TRAIL_SECONDS = 1.75;
 const TRAIL_BANDS = 7;
+const PATH_MS = 7200;
+const PATH_COLOR = '#54eec7';
 const clamp = (value, low, high) => Math.min(high, Math.max(low, value));
 
 export const PALETTE = [
@@ -97,7 +99,7 @@ function drawTerrain(ctx, left, top, width, height) {
 }
 
 function drawField(ctx, layout, rect) {
-  const { width, height, scale, offsetX, offsetY } = layout;
+  const { width, height, scale, offsetX, offsetY, live } = layout;
   const [left, top, right, bottom] = rect;
   const fieldWidth = right - left;
   const fieldHeight = bottom - top;
@@ -133,7 +135,7 @@ function drawField(ctx, layout, rect) {
   grid(ctx, left, top, right, bottom, spacing);
   ctx.strokeStyle = '#7e9bda22';
   grid(ctx, left, top, right, bottom, spacing * 5);
-  drawTerrain(ctx, left, top, fieldWidth, fieldHeight);
+  if (!live) drawTerrain(ctx, left, top, fieldWidth, fieldHeight);
 
   // Long reference axes and a faded calibration target anchor the map.
   const targetRadius = unit * 0.20;
@@ -285,7 +287,7 @@ export class Arena {
     return { x: clamp(point.x, left, right), y: clamp(point.y, top, bottom) };
   }
 
-  resize(field, projection, quality) {
+  resize(field, projection, quality, live) {
     const width = this.canvas.clientWidth;
     const height = this.canvas.clientHeight;
     if (width <= 1 || height <= 1) return null;
@@ -295,7 +297,7 @@ export class Arena {
     const { rect } = field;
     const current = this.layout;
     if (current?.field === field && current.width === width && current.height === height
-        && current.dpr === dpr && current.projection === projection) return current;
+        && current.dpr === dpr && current.projection === projection && current.live === live) return current;
 
     if (this.canvas.width !== pixelWidth || this.canvas.height !== pixelHeight) {
       this.canvas.width = pixelWidth;
@@ -310,7 +312,7 @@ export class Arena {
     const offsetY = (height - fieldHeight * scale) / 2 - top * scale + (projection ? 0 : padding * 0.14);
     const unit = Math.min(rect[2] - rect[0], rect[3] - rect[1]);
     const fxScale = projection ? unit / 720 : clamp(0.7 / scale, unit / 720, unit / 495);
-    this.layout = { field, projection, rect, width, height, dpr, offsetX, offsetY, scale, fxScale };
+    this.layout = { field, projection, live, rect, width, height, dpr, offsetX, offsetY, scale, fxScale };
 
     if (!projection) {
       this.backdrop.width = pixelWidth;
@@ -320,6 +322,37 @@ export class Arena {
       drawField(ctx, this.layout, rect);
     }
     return this.layout;
+  }
+
+  drawMeasuredPaths(ctx, paths, wallTime, scale) {
+    ctx.save();
+    ctx.lineWidth = 1.65 / scale;
+    ctx.lineCap = 'round';
+    ctx.strokeStyle = PATH_COLOR;
+    for (const path of paths) {
+      for (let i = 1; i < path.length; i += 1) {
+        const from = path[i - 1];
+        const to = path[i];
+        const life = 1 - (wallTime - to.time) / PATH_MS;
+        const distance = Math.hypot(to.x - from.x, to.y - from.y);
+        if (life <= 0 || !to.join || distance < 1) continue;
+        ctx.globalAlpha = Math.min(.78, life * .78);
+        ctx.beginPath();
+        ctx.moveTo(from.x, from.y);
+        ctx.lineTo(to.x, to.y);
+        if (i === path.length - 1 && distance * scale > 15) {
+          const angle = Math.atan2(to.y - from.y, to.x - from.x);
+          const x = (from.x + to.x) / 2;
+          const y = (from.y + to.y) / 2;
+          const wing = 5 / scale;
+          ctx.moveTo(x - Math.cos(angle - .65) * wing, y - Math.sin(angle - .65) * wing);
+          ctx.lineTo(x, y);
+          ctx.lineTo(x - Math.cos(angle + .65) * wing, y - Math.sin(angle + .65) * wing);
+        }
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
   }
 
   emit(id, x, y, angle, time, size) {
@@ -576,9 +609,26 @@ export class Arena {
 
   drawMarker(ctx, marker, time, effects, selected, size, projection) {
     const { id, x, y, angle } = marker;
+    if (projection && marker.visible === false) return;
     ctx.save();
     ctx.translate(x, y);
     ctx.scale(size, size);
+    if (marker.visible === false) {
+      ctx.rotate(angle);
+      ctx.globalCompositeOperation = 'source-over';
+      ctx.globalAlpha = .66;
+      ctx.strokeStyle = PALETTE[id].color;
+      ctx.lineWidth = 1.7;
+      ctx.setLineDash([4, 3]);
+      ctx.beginPath();
+      ctx.moveTo(15, 0);
+      ctx.lineTo(-8, -10);
+      ctx.lineTo(-8, 10);
+      ctx.closePath();
+      ctx.stroke();
+      ctx.restore();
+      return;
+    }
     if (!projection) {
       const glow = effects.rings ? 72 : 35;
       ctx.globalAlpha = selected ? 0.73 : 0.54;
@@ -623,6 +673,11 @@ export class Arena {
     const labelX = x + (right ? leader + 10 : -leader - 10 - size);
     const labelY = Math.min(height - 22, y + (above ? -leader - 12 : leader - 7));
     const labelMiddle = labelY + 9;
+    ctx.save();
+    if (marker.visible === false) {
+      ctx.globalAlpha = .68;
+      ctx.setLineDash([3, 3]);
+    }
     ctx.beginPath();
     ctx.moveTo(x + (right ? 16 : -16) * unit, y + (above ? -15 : 15) * unit);
     ctx.lineTo(x + (right ? leader : -leader), labelMiddle);
@@ -640,17 +695,20 @@ export class Arena {
     ctx.textBaseline = 'middle';
     ctx.fillStyle = selected ? '#edfdff' : PALETTE[id].color;
     ctx.fillText(`R–0${id}`, labelX + size / 2, labelMiddle + 0.5);
+    ctx.restore();
   }
 
-  render({ field, markers, time, dt, effects, selected, projection, quality = 1 }) {
+  render({ field, markers, time, dt, effects, selected, projection, quality = 1,
+    live = false, depthImage, paths, wallTime = 0 }) {
     const detail = clamp(quality, 0, 1);
-    const layout = this.resize(field, projection, detail);
+    const layout = this.resize(field, projection, detail, live);
     if (!layout) return;
     this.visibleMarkers = markers;
+    const activeMarkers = live ? markers.filter((marker) => marker.visible) : markers;
     const ctx = this.ctx;
     const { dpr, offsetX, offsetY, scale, fxScale, width, height } = layout;
     const [left, top, right, bottom] = field.rect;
-    this.updateTracks(markers, time, dt, effects, layout, detail);
+    this.updateTracks(activeMarkers, time, dt, live ? { ...effects, trails: false } : effects, layout, detail);
 
     ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     if (projection) {
@@ -665,8 +723,17 @@ export class Arena {
     ctx.beginPath();
     ctx.rect(left, top, right - left, bottom - top);
     ctx.clip();
+    if (live && depthImage && !projection) {
+      ctx.globalAlpha = .76;
+      ctx.drawImage(depthImage, 0, 0, field.width, field.height);
+      ctx.globalAlpha = 1;
+    }
     ctx.globalCompositeOperation = 'lighter';
-    this.drawTrails(ctx, time, fxScale, effects.trails);
+    if (live) {
+      if (effects.trails && paths) this.drawMeasuredPaths(ctx, paths, wallTime, scale);
+    } else {
+      this.drawTrails(ctx, time, fxScale, effects.trails);
+    }
     for (const marker of markers) {
       this.drawMarker(ctx, marker, time, effects, marker.id === selected, fxScale, projection);
     }
@@ -676,7 +743,7 @@ export class Arena {
       ctx.fillStyle = '#000';
       ctx.beginPath();
       const maskRadius = 32 * fxScale;
-      for (const { x, y } of markers) {
+      for (const { x, y } of activeMarkers) {
         ctx.moveTo(x + maskRadius, y);
         ctx.arc(x, y, maskRadius, 0, TAU);
       }
