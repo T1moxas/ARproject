@@ -21,7 +21,7 @@ from calibration_tools import summarize_distance
 from depth_appearance import DepthAppearance, STYLES
 from surface_updates import SurfaceUpdates
 from work_area import WorkArea, calibrate_area, projector_bounds
-from surface_geometry import FloorPlane, HeightRenderer, ProjectorModel
+from surface_geometry import FloorPlane, HeightRenderer, ProjectorModel, project_points
 
 
 CAPTURE_SIZE = (1280, 720)
@@ -164,6 +164,7 @@ class StereoEngine:
         self.sign = 1
         self.fx_baseline = None
         self.rectified_intrinsic = None
+        self.right_to_left_offset = np.zeros(3, dtype=np.float64)
         if calibration is not None:
             with np.load(calibration, allow_pickle=False) as saved:
                 if tuple(saved["capture_size"].tolist()) != CAPTURE_SIZE:
@@ -185,6 +186,12 @@ class StereoEngine:
                 self.sign = 1 if p2[0, 3] < 0 else -1
                 self.fx_baseline = abs(float(p2[0, 3]))
                 self.rectified_intrinsic = p1[:, :3].copy()
+                # Projection matrices for stereo triangulation in rectified_left.
+                self.rectified_projections = (p1.copy(), p2.copy())
+                # P2 = K [I | T] in the rectified left-camera frame.
+                # Convert right-camera PnP coordinates back into left-camera coordinates.
+                self.right_to_left_offset = np.array(
+                    [-p2[0, 3] / p2[0, 0], 0.0, 0.0], dtype=np.float64)
         if self.calibrated and disparities is None:
             # d = f*B/Z. A fixed 64-pixel search previously excluded everything
             # nearer than ~94 cm on this rig, regardless of the colour scale.
@@ -311,6 +318,160 @@ def sample_depth(depth, point=(0.5, 0.5), radius=3, allow_nonpositive=False):
     return float(np.median(values)) if values.size >= 3 else None
 
 
+class ArucoRobotTracker:
+    """Detect matching robot tags in both rectified stereo views and fuse their poses."""
+
+    ALLOWED_IDS = set(range(6))
+
+    def __init__(self, marker_size_m=0.05, glow_size_m=0.16):
+        if not hasattr(cv2, "aruco"):
+            raise RuntimeError("ArUco support is missing; install an OpenCV build with the aruco module")
+        self.marker_size = float(marker_size_m)
+        self.glow_size = float(glow_size_m)
+        aruco = cv2.aruco
+        dictionary = aruco.getPredefinedDictionary(aruco.DICT_4X4_50)
+        parameters = aruco.DetectorParameters()
+        self.detector = aruco.ArucoDetector(dictionary, parameters)
+        half = self.marker_size / 2
+        self.object_corners = np.array([
+            [-half, half, 0], [half, half, 0],
+            [half, -half, 0], [-half, -half, 0]
+        ], dtype=np.float64)
+        glow_half = self.glow_size / 2
+        self.glow_corners = np.array([
+            [-glow_half, glow_half, 0], [glow_half, glow_half, 0],
+            [glow_half, -glow_half, 0], [-glow_half, -glow_half, 0]
+        ], dtype=np.float64)
+
+    def _detect_one(self, gray, intrinsic):
+        corners, ids, _ = self.detector.detectMarkers(gray)
+        poses, accepted_corners, accepted_ids = {}, [], []
+        zero_distortion = np.zeros((5, 1), dtype=np.float64)
+        if ids is not None:
+            for image_corners, raw_id in zip(corners, ids.reshape(-1)):
+                marker_id = int(raw_id)
+                if marker_id not in self.ALLOWED_IDS:
+                    continue
+                image_points = image_corners.reshape(4, 2).astype(np.float64)
+                ok, rvec, tvec = cv2.solvePnP(
+                    self.object_corners, image_points, intrinsic, zero_distortion,
+                    flags=cv2.SOLVEPNP_IPPE_SQUARE)
+                if not ok:
+                    continue
+                tvec = np.asarray(tvec, dtype=np.float64).reshape(3)
+                if not np.isfinite(tvec).all() or tvec[2] <= 0:
+                    continue
+                rotation, _ = cv2.Rodrigues(rvec)
+                poses[marker_id] = {
+                    "image_points": image_points,
+                    "center_pnp": tvec,
+                    "rotation_pnp": rotation,
+                }
+                accepted_corners.append(image_corners.reshape(1, 4, 2).astype(np.float32))
+                accepted_ids.append(marker_id)
+        annotated = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+        if accepted_ids:
+            cv2.aruco.drawDetectedMarkers(
+                annotated, accepted_corners,
+                np.asarray(accepted_ids, dtype=np.int32).reshape(-1, 1))
+            for marker_id, image_corners in zip(accepted_ids, accepted_corners):
+                x, y = np.rint(image_corners[0].mean(axis=0)).astype(int)
+                cv2.putText(annotated, f"ROBOT {marker_id}", (x + 8, y - 8),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2, cv2.LINE_AA)
+        return poses, annotated
+
+    def detect_pair(self, left_gray, right_gray, intrinsic, projection_matrices):
+        left_poses, left_annotated = self._detect_one(left_gray, intrinsic)
+        right_poses, right_annotated = self._detect_one(right_gray, intrinsic)
+        p_left, p_right = projection_matrices
+        found = []
+        for marker_id in sorted(set(left_poses) & set(right_poses)):
+            lp, rp = left_poses[marker_id], right_poses[marker_id]
+            # Both images are already rectified. Triangulate corresponding
+            # corners into the exact rectified_left frame used by projector_model.
+            q = cv2.triangulatePoints(p_left, p_right,
+                                      lp["image_points"].T, rp["image_points"].T)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                xyz = (q[:3] / q[3:4]).T
+            use_stereo = (xyz.shape == (4, 3) and np.isfinite(xyz).all()
+                          and np.all(xyz[:, 2] > 0.05) and np.all(xyz[:, 2] < 8.0))
+            if use_stereo:
+                centre = xyz.mean(axis=0)
+                # Marker local X points from corner 0 to 1; local Y from 0 to 3.
+                axis_x = ((xyz[1] - xyz[0]) + (xyz[2] - xyz[3])) * 0.5
+                axis_y = ((xyz[3] - xyz[0]) + (xyz[2] - xyz[1])) * 0.5
+                nx = np.linalg.norm(axis_x)
+                if nx < 1e-8:
+                    use_stereo = False
+                else:
+                    axis_x /= nx
+                    axis_y -= axis_x * float(axis_x @ axis_y)
+                    ny = np.linalg.norm(axis_y)
+                    if ny < 1e-8:
+                        use_stereo = False
+                    else:
+                        axis_y /= ny
+            if not use_stereo:
+                # Safe fallback: retain the working left-camera PnP path so
+                # a noisy/missing stereo correspondence never blanks projection.
+                centre = lp["center_pnp"]
+                rotation = lp["rotation_pnp"]
+                axis_x = rotation[:, 0]
+                axis_y = -rotation[:, 1]
+            half = self.glow_size * 0.5
+            # Axis Y is image-down; these four points form an oriented frame
+            # centred exactly on the estimated marker centre.
+            glow = np.array([
+                centre - axis_x * half - axis_y * half,
+                centre + axis_x * half - axis_y * half,
+                centre + axis_x * half + axis_y * half,
+                centre - axis_x * half + axis_y * half,
+            ], dtype=np.float64)
+            found.append({"id": marker_id, "center": centre,
+                          "camera_corners": glow, "stereo_used": bool(use_stereo)})
+        return found, left_annotated, right_annotated
+
+    @staticmethod
+    def overlay(base, detections, projector_model, rectangle):
+        if not detections or projector_model is None:
+            return base.copy()
+        output = base.copy()
+        h, w = output.shape[:2]
+        mask = np.zeros((h, w), dtype=np.uint8)
+        polygons, centres = [], []
+        for detection in detections:
+            pixels, z = project_points(projector_model.matrix, detection["camera_corners"])
+            centre_pixel, centre_z = project_points(
+                projector_model.matrix, np.asarray(detection["center"], dtype=np.float64).reshape(1, 3))
+            if (not np.isfinite(pixels).all() or not np.all(z > 0)
+                    or not np.isfinite(centre_pixel).all() or not np.all(centre_z > 0)):
+                continue
+            polygon = np.rint(pixels).astype(np.int32)
+            centre = np.rint(centre_pixel[0]).astype(int)
+            polygons.append(polygon)
+            centres.append(centre)
+            cv2.fillPoly(mask, [polygon], 255, lineType=cv2.LINE_AA)
+        if not polygons:
+            return output
+        for polygon in polygons:
+            solid = np.zeros_like(mask)
+            cv2.fillPoly(solid, [polygon], 255, lineType=cv2.LINE_AA)
+            inner = cv2.erode(solid, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)))
+            mask = cv2.max(mask, cv2.subtract(solid, inner))
+        glow = cv2.GaussianBlur(mask, (0, 0), 9.0)
+        white = np.repeat((glow.astype(np.float32) * 0.78)[:, :, None], 3, axis=2)
+        output = np.maximum(output, white.astype(np.uint8))
+        for polygon, centre in zip(polygons, centres):
+            cv2.polylines(output, [polygon], True, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.circle(output, tuple(centre), 4, (255, 255, 255), -1, cv2.LINE_AA)
+        left, top, right, bottom = rectangle
+        output[:top] = 0
+        output[bottom:] = 0
+        output[:, :left] = 0
+        output[:, right:] = 0
+        return output
+
+
 def arguments():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--left", type=int, default=None, help="Logical left camera; default from calibration")
@@ -373,6 +534,11 @@ def arguments():
     parser.add_argument("--compare", action="store_true", help="Measure both resolutions sequentially and exit")
     parser.add_argument("--seconds", type=float, default=0, help="Duration per mode, 0=until closed (compare: 10s)")
     parser.add_argument("--output", type=Path, default=Path("results/live"))
+    parser.add_argument("--aruco", action="store_true", help="Track robot markers 0-5 (DICT_4X4_50) and project a white halo")
+    parser.add_argument("--aruco-marker-mm", type=float, default=50.0, help="Physical marker side length in mm")
+    parser.add_argument("--aruco-glow-mm", type=float, default=160.0, help="Projected halo square side length in mm")
+    parser.add_argument("--lan-preview", action="store_true", help="Serve the colourized depth preview over LAN HTTP")
+    parser.add_argument("--lan-preview-port", type=int, default=8765, help="LAN preview HTTP port")
     args = parser.parse_args()
     saved_indices = [0, 1]
     if args.calibration.is_file() and (args.left is None or args.right is None):
@@ -412,6 +578,9 @@ def arguments():
         parser.error("Need check-interval > 0, update-interval > 0, change-mm > 0 and 0 < change-area <= 1")
     if args.reference_m is not None and (not math.isfinite(args.reference_m) or args.reference_m <= 0):
         parser.error("reference-m must be finite and positive")
+    if (not math.isfinite(args.aruco_marker_mm) or not math.isfinite(args.aruco_glow_mm)
+            or args.aruco_marker_mm <= 0 or args.aruco_glow_mm <= args.aruco_marker_mm):
+        parser.error("ArUco marker/glow sizes must be positive and glow larger than marker")
     if args.validation_frames < 10:
         parser.error("validation-frames must be >= 10")
     if any(value is not None and not math.isfinite(value) for value in (args.focus_left, args.focus_right)):
@@ -458,6 +627,10 @@ def run(args):
                          for item in SIZES} if floor_reference else {})
     projector_model = (ProjectorModel.load(args.projector_model, output_size, calibration_hash)
                        if args.projector_3d and not args.calibrate_area and args.projector_model.is_file() else None)
+    aruco_tracker = (ArucoRobotTracker(args.aruco_marker_mm / 1000, args.aruco_glow_mm / 1000)
+                     if args.aruco else None)
+    if aruco_tracker is not None and projector_model is None:
+        raise ValueError("ArUco projector glow needs the calibrated 3D projector model; enable --projector-3d")
     requested_rect = (projector_bounds(output_size, args.projector_inset_x or 0, args.projector_inset_y or 0)
                       if args.projector_inset_x is not None or args.projector_inset_y is not None else None)
     work_area = None
@@ -474,7 +647,15 @@ def run(args):
     field_left, field_top, field_right, field_bottom = field_rect
     field_size = (field_right - field_left, field_bottom - field_top)
     cameras = [Camera(args.left, focus_values[0]), Camera(args.right, focus_values[1])]
+    lan_preview = None
+    if args.lan_preview:
+        from depth_http_preview import DepthPreview
+        lan_preview = DepthPreview(port=args.lan_preview_port, calibrated=calibration is not None)
     previous = (0, 0)
+    aruco_detections = []
+    aruco_annotated = None
+    aruco_right_annotated = None
+    projector_base = np.zeros((args.height, args.width, 3), np.uint8)
     periods = []
     measurements = deque(maxlen=900)
     frame_count = 0
@@ -580,6 +761,8 @@ def run(args):
     try:
         print(f"Starting two cameras; update mode: {args.update_mode}. 1/2: resolution; B/G: algorithm; "
               "S: appearance; F: fill; R: rescan; P: projector area; Esc: stop.", flush=True)
+        if aruco_tracker is not None:
+            print("ArUco tracking enabled: DICT_4X4_50, IDs 0-5, marker 50 mm; white projector halo.", flush=True)
         if calibration is None:
             print("UNCALIBRATED diagnostic disparity: colours are not measured depth.", flush=True)
         while True:
@@ -628,6 +811,10 @@ def run(args):
                 begin = now
                 next_probe = now + args.check_interval
                 raw_colors, depth, valid = engines[size].compute(left.image, right.image)
+                if aruco_tracker is not None and engines[size].last_rectified is not None:
+                    aruco_detections, aruco_annotated, aruco_right_annotated = aruco_tracker.detect_pair(
+                        engines[size].last_rectified[0], engines[size].last_rectified[1],
+                        engines[size].rectified_intrinsic, engines[size].rectified_projections)
                 if work_area and depth is not None:
                     depth = work_area.restrict(depth)
                     raw_colors = raw_colors.copy()
@@ -672,7 +859,13 @@ def run(args):
                     if calibration is None:
                         label(output[field_top:field_bottom, field_left:field_right],
                               "UNCALIBRATED DISPARITY - NOT DEPTH", color=(0, 200, 255))
+                    projector_base = output.copy()
+                    if aruco_tracker is not None:
+                        output = ArucoRobotTracker.overlay(projector_base, aruco_detections,
+                                                           projector_model, field_rect)
                     cv2.imshow(PROJECTOR, output)
+                    if lan_preview is not None:
+                        lan_preview.update(colors)
                 appearance_ms = (time.perf_counter() - appearance_begin) * 1000
                 if pending_check is not None:
                     value = sample_depth(depth, sample_point)
@@ -693,7 +886,21 @@ def run(args):
                         print(json.dumps({"distance_check": result}), flush=True)
                         pending_check = None
                 if time.perf_counter() - last_preview >= 1 / args.diagnostics_fps:
-                    tiles = [cv2.resize(image, (640, 360)) for image in (left.image, right.image, canonical)]
+                    left_preview = (aruco_annotated if aruco_annotated is not None else left.image)
+                    tiles = []
+                    right_preview = (aruco_right_annotated if aruco_right_annotated is not None
+                                     else right.image)
+                    for image in (left_preview, right_preview, canonical):
+                        # Keep diagnostic tiles consistently three-channel BGR.
+                        if image.ndim == 2:
+                            image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+                        elif image.ndim == 3 and image.shape[2] == 1:
+                            image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+                        elif image.ndim == 3 and image.shape[2] == 4:
+                            image = cv2.cvtColor(image, cv2.COLOR_BGRA2BGR)
+                        elif image.ndim != 3 or image.shape[2] != 3:
+                            raise ValueError(f"Unsupported preview image shape: {image.shape}")
+                        tiles.append(cv2.resize(image, (640, 360)))
                     info = np.zeros_like(tiles[0])
                     fps = frame_count / max(0.001, time.perf_counter() - started)
                     selected_depth = sample_depth(depth, sample_point)
@@ -829,6 +1036,8 @@ def run(args):
     finally:
         if not completed:
             finish_period()
+        if lan_preview is not None:
+            lan_preview.close()
         for camera in cameras:
             camera.close()
         cv2.destroyAllWindows()

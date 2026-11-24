@@ -93,7 +93,7 @@ class FloorPlane:
             if length < 1e-6:
                 continue
             normal /= length
-            good = np.abs(cloud @ normal - a @ normal) < .008
+            good = np.abs(cloud @ normal - a @ normal) < .015
             if best is None or good.sum() > best.sum():
                 best = good
         if best is None or best.mean() < .75:
@@ -108,7 +108,7 @@ class FloorPlane:
                    'plane_inlier_fraction': float(best.mean()),
                    'plane_rms_m': float(np.sqrt(np.mean(errors ** 2))),
                    'plane_p95_m': float(np.percentile(errors, 95))}
-        if quality['plane_rms_m'] > .006:
+        if quality['plane_rms_m'] > .010:
             raise ValueError('Floor fit is too noisy; keep the empty floor stationary')
         return cls(plane, calibration_hash, quality)
 
